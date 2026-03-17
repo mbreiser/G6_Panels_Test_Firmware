@@ -101,6 +101,8 @@ python3 test_firmware/single_led/auto_test.py cmd "BURST 10000"
 - **Phase 3b**: PIO-based scanning (PIO columns + CPU rows, 0.62 µs/row overhead)
 - **Phase 3c**: DMA-fed PIO — hybrid DMA columns + ISR row switching (0.58 µs/row overhead, CPU free between ISRs)
 - **Phase 3d**: Multi-SM PIO — dual PIO blocks (row SM on PIO1, col SM on PIO0) with bridge ISRs (0.37 µs/row overhead, ~3 µs jitter at 10 µs ON). Visually verified LEDs active during scanning.
+- **Phase 3e**: Burst-mode scanning — simulated 8 kHz trigger, `noInterrupts()` during scan burst. Confirmed zero jitter (0.000 µs) for PIOSCAN burst mode.
+- **Phase 4**: BCM grayscale — single-row-per-trigger BCM with 3 modes (PIO/DMA/MSM). Mode A (PIO) achieves 0.007 µs jitter, 0 outliers. 4-bit BCM at T=0.5 µs: 9.5 µs burst, fits 13 µs budget with 3.5 µs margin. 400 Hz frame rate.
 
 ## Key Technical Findings
 
@@ -133,25 +135,40 @@ At ON = 0.25–0.5 µs, 10k frames:
 
 MSMSCAN has lower overhead but its ISR-dependent jitter (11–23 µs at short ON) makes it unsuitable for the tight 15 µs window. MSMSCAN may still be useful for free-running BCM display where jitter tolerance is higher.
 
-### Open jitter question
-Current jitter measurements are from continuous free-running scanning. The actual 2P use case is burst scanning (15 µs active, 110 µs idle). Burst-mode jitter with `noInterrupts()` only during the scan window should be significantly better than continuous-mode numbers. **This needs to be measured.**
+### Burst-mode BCM achieves zero jitter (Phase 4 — RESOLVED)
+Single-row-per-trigger BCM with `noInterrupts()` during the scan burst (Mode A / PIOSCAN) gives **0.007 µs jitter** (1 CPU cycle) and **0 outliers** across all tested configurations. The burst architecture — `noInterrupts()` for ~10 µs scan, `interrupts()` for ~115 µs idle — completely eliminates timing variation.
+
+### BCM burst timing budget (Phase 4 results)
+At 150 MHz, 8 kHz trigger, Mode A (PIO + noInterrupts):
+| Config | Burst (µs) | Jitter (µs) | Fits 13µs? | Margin |
+|--------|-----------|-------------|------------|--------|
+| 4-bit T=0.50µs | 9.51 | 0.007 | YES | 3.5µs |
+| 4-bit T=0.25µs | 5.77 | 0.007 | YES | 7.2µs |
+| 4-bit T=0.75µs | 13.27 | 0.007 | NO | -0.3µs |
+| 3-bit T=1.00µs | 8.59 | 0.007 | YES | 4.4µs |
+| 3-bit T=1.50µs | 12.09 | 0.007 | YES | 0.9µs |
+
+**Recommended**: 4-bit BCM, T=0.5 µs → 16 intensity levels, 9.5 µs burst, 3.5 µs margin. Frame rate = 400 Hz.
+
+Modes B (DMA) and C (MSM/DMA) are ~1.3 µs faster but introduce 0.7–5.5 µs jitter from DMA interrupt overhead. Mode A is the only mode suitable for 2P sync.
 
 ## Next Steps
 
-### Critical path (jitter and timing budget)
-1. **Burst-mode jitter measurement** — Implement a trigger-simulated scan mode: `noInterrupts()` → scan 20 rows → `interrupts()` → idle 110 µs → repeat. Measure jitter in this regime. This is the actual operating condition.
-2. **Overclock to 200 MHz** — One-line config change, reduces row overhead by ~25%. At 200 MHz, PIOSCAN overhead drops from 0.61→~0.46 µs, making 20-row frames feasible at ON=0.25 µs: 20×(0.25+0.46) = 14.2 µs < 15 µs target.
-3. **External trigger interface** — GPIO interrupt or PIO `wait pin` for 2P sync. Trigger marks start of each 15 µs scan window.
+### Immediate
+1. **External trigger interface** — GPIO interrupt or PIO `wait pin` for 2P sync. Replace simulated DWT trigger with real hardware input from microscope.
+2. **Overclock to 200 MHz** — Optional. Would expand T range (4-bit T≤1.0 µs in 13 µs) but not required since T=0.5 µs already works at 150 MHz.
 
-### After timing is locked down
-- **Phase 4: BCM grayscale** — 4-bit BCM within the scan window. Each frame scans all rows at one bit weight; 4 frames per display update. Must fit within timing budget.
+### After trigger is working
 - **Optical characterization** — photodiode + external ADC to measure LED linearity, rise/fall time, load-dependent brightness. Build calibration LUT if needed.
+- **Per-pixel pattern loading** — USB or SPI interface for host to send pixel_data[20][20] frames
 
 ### Completed explorations
-- ~~**Multi-SM PIO (MSMSCAN)**~~ — Implemented (Phase 3d). Lowest overhead (0.37 µs) but ISR-dependent jitter (11–23 µs at short ON) makes it unsuitable for 2P sync. May be useful for free-running display.
+- ~~**Multi-SM PIO (MSMSCAN)**~~ — Implemented (Phase 3d). Lowest overhead (0.37 µs) but ISR-dependent jitter makes it unsuitable for 2P sync.
 - ~~**Pure DMA-fed PIO**~~ — Ruled out. SIO GPIO is not DMA-accessible.
+- ~~**Burst-mode jitter**~~ — Measured (Phase 3e). Zero jitter confirmed with `noInterrupts()` burst architecture.
+- ~~**BCM grayscale**~~ — Implemented (Phase 4). 4-bit BCM at T=0.5 µs fits in 9.5 µs with 3.5 µs margin. Zero jitter, zero outliers.
 
-**Guiding principle**: Jitter and timing budget compliance come first. Throughput optimizations only matter if they don't compromise timing predictability within the 15 µs scan window.
+**Guiding principle**: Jitter and timing budget compliance come first. Mode A (PIO + noInterrupts) is the production architecture.
 
 ## Important Files
 
@@ -174,5 +191,6 @@ PIO: `PIOSCAN n`, `PIOSCAN2 n` (unprotected), `PIOROWTIME n`
 Hybrid DMA+ISR: `DMASCAN n`, `DMATEST`
 Multi-SM PIO: `MSMSCAN n`, `MSMTEST`
 Burst mode (2P sync sim): `BURST n [rate_hz]` — default 8 kHz trigger rate, `noInterrupts()` during scan burst
+BCM burst (Phase 4): `BCM bits`, `BCMON us`, `FILL intensity`, `GRADIENT`, `BCMBURST n [Hz] [A|B|C]`
 System: `REBOOT` (enters BOOTSEL mode for flashing)
 `HELP` for full list.

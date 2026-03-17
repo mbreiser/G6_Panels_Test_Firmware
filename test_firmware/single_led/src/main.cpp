@@ -66,6 +66,8 @@ static uint32_t stat_off_min = UINT32_MAX;
 static uint32_t stat_off_max = 0;
 static uint64_t stat_off_sum = 0;
 static uint32_t stat_count   = 0;
+static uint32_t stat_outlier_count = 0;     // events > 2x nominal
+static uint32_t stat_outlier_threshold = 0; // set before measurement
 
 static void stats_reset() {
     stat_on_min  = UINT32_MAX;
@@ -75,6 +77,8 @@ static void stats_reset() {
     stat_off_max = 0;
     stat_off_sum = 0;
     stat_count   = 0;
+    stat_outlier_count = 0;
+    // Note: stat_outlier_threshold is set by the caller before measurement
 }
 
 static void __not_in_flash_func(stats_update)(uint32_t on_cyc, uint32_t off_cyc) {
@@ -85,6 +89,8 @@ static void __not_in_flash_func(stats_update)(uint32_t on_cyc, uint32_t off_cyc)
     if (off_cyc > stat_off_max) stat_off_max = off_cyc;
     stat_off_sum += off_cyc;
     stat_count++;
+    if (stat_outlier_threshold > 0 && on_cyc > stat_outlier_threshold)
+        stat_outlier_count++;
 }
 
 // Generic stats printer with custom label for the two fields
@@ -119,6 +125,19 @@ static void stats_print_fields(const char* label,
         Serial.print("us  mean=");
         Serial.print(f2_mean, 3);
         Serial.println("us");
+    }
+    float jitter = cycles_to_us(stat_on_max) - cycles_to_us(stat_on_min);
+    Serial.print("  Jitter (max-min): ");
+    Serial.print(jitter, 3);
+    Serial.println("us");
+    if (stat_outlier_threshold > 0) {
+        Serial.print("  Outliers (>2x nominal): ");
+        Serial.print(stat_outlier_count);
+        Serial.print(" / ");
+        Serial.print(stat_count);
+        Serial.print(" (");
+        Serial.print(stat_count > 0 ? 100.0f * stat_outlier_count / stat_count : 0.0f, 2);
+        Serial.println("%)");
     }
 }
 
@@ -175,6 +194,12 @@ static uint64_t col_on_mask;               // mask of column pins to set LOW (ON
 static uint64_t col_off_mask;              // mask of column pins to set HIGH (OFF)
 static uint64_t all_col_mask;              // mask of ALL column pins
 
+// BCM state (Phase 4)
+static uint8_t  bcm_bits = 4;                            // N-bit BCM (3-8)
+static float    bcm_base_on_us = 0.5f;                   // base time unit T (µs)
+static uint8_t  pixel_data[PANEL_SIZE][PANEL_SIZE];       // intensity per pixel
+static uint32_t bcm_plane_data[PANEL_SIZE][8][2];         // [row][bit] = {pio_pattern, pio_delay}
+
 static void precompute_scan_masks() {
     // Row masks (schematic row pins)
     for (int r = 0; r < PANEL_SIZE; r++) {
@@ -193,6 +218,37 @@ static void precompute_scan_masks() {
             col_on_mask |= pin_mask;   // this column should be ON (driven LOW)
         } else {
             col_off_mask |= pin_mask;  // this column should be OFF (driven HIGH)
+        }
+    }
+}
+
+// PIO ON overhead: the PIO column program takes 5 cycles of overhead per row
+// (pull+mov+jmp_loop_entry+mov+out). ON time = (delay_count + 5) PIO cycles.
+#define PIO_ON_OVERHEAD_CYCLES 5
+
+// Pre-compute BCM bit-plane data from pixel_data[][]
+// For each row and bit-plane: extract column pattern, compute PIO delay
+static void precompute_bcm_data() {
+    uint32_t base_cycles = (uint32_t)(bcm_base_on_us * cycles_per_us);
+    for (int r = 0; r < PANEL_SIZE; r++) {
+        for (int b = 0; b < bcm_bits; b++) {
+            // Extract bit-plane b: which schematic columns should be ON
+            uint32_t pattern = 0;
+            for (int c = 0; c < PANEL_SIZE; c++) {
+                // Map layout col → schematic col for correct physical pin
+                uint8_t sch_col = layout_to_sch_col[r][c];
+                if (pixel_data[r][c] & (1 << b)) {
+                    pattern |= (1UL << sch_col);
+                }
+            }
+            // Invert for PIO (LOW = ON for reversed polarity LEDs)
+            uint32_t pio_col_word = (~pattern) & 0xFFFFF;
+            // Delay = T * 2^b, adjusted for PIO overhead
+            uint32_t on_cycles_b = base_cycles * (1U << b);
+            uint32_t pio_delay = (on_cycles_b > PIO_ON_OVERHEAD_CYCLES)
+                               ? (on_cycles_b - PIO_ON_OVERHEAD_CYCLES) : 0;
+            bcm_plane_data[r][b][0] = pio_col_word;
+            bcm_plane_data[r][b][1] = pio_delay;
         }
     }
 }
@@ -302,13 +358,6 @@ static void col_pins_to_sio() {
         gpio_put(COL_PIN[c], 1);  // OFF state (HIGH)
     }
 }
-
-// PIO scan overhead per row:
-//   From "out pins, 20" (columns ON) to next "out pins, 20" (columns OFF):
-//   pull(1) + mov(1) + jmp_loop(x+1) + mov(1) + out(1) = x + 5 cycles
-//   So ON time = (delay_count + 5) PIO cycles
-//   For target on_cycles: delay_count = on_cycles - 5 (min 0)
-#define PIO_ON_OVERHEAD_CYCLES 5
 
 // ---------------------------------------------------------------------------
 // Hybrid DMA + ISR scan infrastructure (Phase 3c)
@@ -1709,6 +1758,464 @@ static void cmd_burst(const char* arg) {
 }
 
 // ---------------------------------------------------------------------------
+// BCM Burst-Mode Scanning (Phase 4)
+// ---------------------------------------------------------------------------
+// Single-row-per-trigger BCM: each 8 kHz trigger scans ONE row through
+// all bit-planes. Rows cycle across triggers → full frame at 400 Hz.
+
+// Mode A: PIO burst BCM (PIOSCAN-based, noInterrupts during burst)
+static void __not_in_flash_func(run_bcm_burst_pio)(
+    uint32_t n_triggers, float trigger_rate_hz)
+{
+    stats_reset();
+    if (!dwt_available) {
+        Serial.println("ERR: DWT not available");
+        return;
+    }
+
+    precompute_scan_masks();
+    precompute_bcm_data();
+
+    uint32_t trigger_period_cyc = (uint32_t)(cycles_per_us * 1000000.0f / trigger_rate_hz);
+
+    // Compute expected burst time for outlier threshold (2x nominal)
+    uint32_t base_cycles = (uint32_t)(bcm_base_on_us * cycles_per_us);
+    uint32_t nominal_burst_cyc = 0;
+    for (int b = 0; b < bcm_bits; b++) {
+        uint32_t on_cyc_b = base_cycles * (1U << b);
+        nominal_burst_cyc += on_cyc_b + PIO_ON_OVERHEAD_CYCLES + 50; // ~50 cyc CPU overhead per pass
+    }
+    stat_outlier_threshold = nominal_burst_cyc * 2;
+
+    // Reset and enable PIO SM
+    pio_sm_set_enabled(pio_hw_inst, pio_sm_idx, false);
+    pio_sm_clear_fifos(pio_hw_inst, pio_sm_idx);
+    pio_sm_restart(pio_hw_inst, pio_sm_idx);
+    pio_sm_exec(pio_hw_inst, pio_sm_idx, pio_encode_jmp(pio_offset));
+    pio_interrupt_clear(pio_hw_inst, 0);
+    pio_sm_set_enabled(pio_hw_inst, pio_sm_idx, true);
+
+    // Push all-OFF mask for Y register init
+    pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, 0xFFFFF);
+
+    // Warm-up: one row with all bit-planes
+    noInterrupts();
+    gpio_set_mask64(row_on_mask[0]);
+    for (int b = 0; b < bcm_bits; b++) {
+        pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, bcm_plane_data[0][b][0]);
+        pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, bcm_plane_data[0][b][1]);
+        while (!pio_interrupt_get(pio_hw_inst, 0)) {}
+        pio_interrupt_clear(pio_hw_inst, 0);
+    }
+    gpio_clr_mask64(row_on_mask[0]);
+    interrupts();
+
+    // Main trigger loop
+    uint32_t trigger_start = m33_hw->dwt_cyccnt;
+    uint8_t row = 0;
+
+    for (uint32_t t = 0; t < n_triggers; t++) {
+        // Wait for next trigger edge (simulated)
+        while ((m33_hw->dwt_cyccnt - trigger_start) < trigger_period_cyc) {}
+        trigger_start += trigger_period_cyc;
+
+        // --- Scan burst: one row, all bit-planes ---
+        noInterrupts();
+        uint32_t burst_start = m33_hw->dwt_cyccnt;
+
+        gpio_set_mask64(row_on_mask[row]);
+        for (int b = 0; b < bcm_bits; b++) {
+            pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, bcm_plane_data[row][b][0]);
+            pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, bcm_plane_data[row][b][1]);
+            while (!pio_interrupt_get(pio_hw_inst, 0)) {}
+            pio_interrupt_clear(pio_hw_inst, 0);
+        }
+        gpio_clr_mask64(row_on_mask[row]);
+
+        uint32_t burst_end = m33_hw->dwt_cyccnt;
+        interrupts();
+
+        stats_update(burst_end - burst_start, 0);
+
+        row++;
+        if (row >= active_rows) row = 0;
+
+        if ((t % 1000 == 999) && Serial.available()) {
+            Serial.print("  (interrupted at trigger ");
+            Serial.print(t + 1);
+            Serial.println(")");
+            break;
+        }
+    }
+
+    pio_sm_set_enabled(pio_hw_inst, pio_sm_idx, false);
+    all_off();
+}
+
+// Mode B: DMA burst BCM (DMA feeds PIO, CPU polls completion)
+static void __not_in_flash_func(run_bcm_burst_dma)(
+    uint32_t n_triggers, float trigger_rate_hz)
+{
+    stats_reset();
+    if (!dwt_available) {
+        Serial.println("ERR: DWT not available");
+        return;
+    }
+
+    precompute_scan_masks();
+    precompute_bcm_data();
+
+    uint32_t trigger_period_cyc = (uint32_t)(cycles_per_us * 1000000.0f / trigger_rate_hz);
+
+    // Compute outlier threshold
+    uint32_t base_cycles = (uint32_t)(bcm_base_on_us * cycles_per_us);
+    uint32_t nominal_burst_cyc = 0;
+    for (int b = 0; b < bcm_bits; b++) {
+        nominal_burst_cyc += base_cycles * (1U << b) + PIO_ON_OVERHEAD_CYCLES + 30;
+    }
+    stat_outlier_threshold = nominal_burst_cyc * 2;
+
+    // Reset and enable PIO SM (same PIO program as Mode A)
+    pio_sm_set_enabled(pio_hw_inst, pio_sm_idx, false);
+    pio_sm_clear_fifos(pio_hw_inst, pio_sm_idx);
+    pio_sm_restart(pio_hw_inst, pio_sm_idx);
+    pio_sm_exec(pio_hw_inst, pio_sm_idx, pio_encode_jmp(pio_offset));
+    pio_interrupt_clear(pio_hw_inst, 0);
+    pio_sm_set_enabled(pio_hw_inst, pio_sm_idx, true);
+    pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, 0xFFFFF);
+
+    // Claim DMA channel for feeding PIO TX FIFO
+    int dma_ch = dma_claim_unused_channel(false);
+    if (dma_ch < 0) {
+        Serial.println("ERR: No free DMA channel for BCM");
+        pio_sm_set_enabled(pio_hw_inst, pio_sm_idx, false);
+        return;
+    }
+
+    dma_channel_config dma_cfg = dma_channel_get_default_config(dma_ch);
+    channel_config_set_transfer_data_size(&dma_cfg, DMA_SIZE_32);
+    channel_config_set_read_increment(&dma_cfg, true);
+    channel_config_set_write_increment(&dma_cfg, false);
+    channel_config_set_dreq(&dma_cfg, pio_get_dreq(pio_hw_inst, pio_sm_idx, true));
+
+    // Warm-up
+    noInterrupts();
+    gpio_set_mask64(row_on_mask[0]);
+    for (int b = 0; b < bcm_bits; b++) {
+        pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, bcm_plane_data[0][b][0]);
+        pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, bcm_plane_data[0][b][1]);
+        while (!pio_interrupt_get(pio_hw_inst, 0)) {}
+        pio_interrupt_clear(pio_hw_inst, 0);
+    }
+    gpio_clr_mask64(row_on_mask[0]);
+    interrupts();
+
+    // Main trigger loop
+    uint32_t trigger_start = m33_hw->dwt_cyccnt;
+    uint8_t row = 0;
+
+    for (uint32_t t = 0; t < n_triggers; t++) {
+        while ((m33_hw->dwt_cyccnt - trigger_start) < trigger_period_cyc) {}
+        trigger_start += trigger_period_cyc;
+
+        noInterrupts();
+        uint32_t burst_start = m33_hw->dwt_cyccnt;
+
+        gpio_set_mask64(row_on_mask[row]);
+
+        // Start DMA: feed all bit-plane data to PIO TX FIFO
+        dma_channel_configure(dma_ch, &dma_cfg,
+            &pio_hw_inst->txf[pio_sm_idx],   // write to PIO TX FIFO
+            &bcm_plane_data[row][0][0],       // read from pre-computed data
+            bcm_bits * 2,                     // 2 words per bit-plane
+            true);                            // start immediately
+
+        // Poll PIO IRQ for each bit-plane completion
+        for (int b = 0; b < bcm_bits; b++) {
+            while (!pio_interrupt_get(pio_hw_inst, 0)) {}
+            pio_interrupt_clear(pio_hw_inst, 0);
+        }
+
+        gpio_clr_mask64(row_on_mask[row]);
+        uint32_t burst_end = m33_hw->dwt_cyccnt;
+        interrupts();
+
+        stats_update(burst_end - burst_start, 0);
+
+        row++;
+        if (row >= active_rows) row = 0;
+
+        if ((t % 1000 == 999) && Serial.available()) {
+            Serial.print("  (interrupted at trigger ");
+            Serial.print(t + 1);
+            Serial.println(")");
+            break;
+        }
+    }
+
+    pio_sm_set_enabled(pio_hw_inst, pio_sm_idx, false);
+    dma_channel_unclaim(dma_ch);
+    all_off();
+}
+
+// Mode C: MSM burst BCM (col SM on PIO0, row held by CPU)
+// Uses the MSM column SM but row is held constant by CPU GPIO.
+// No bridge ISRs needed since row doesn't change during burst.
+static void __not_in_flash_func(run_bcm_burst_msm)(
+    uint32_t n_triggers, float trigger_rate_hz)
+{
+    stats_reset();
+    if (!dwt_available) {
+        Serial.println("ERR: DWT not available");
+        return;
+    }
+
+    precompute_scan_masks();
+    precompute_bcm_data();
+
+    uint32_t trigger_period_cyc = (uint32_t)(cycles_per_us * 1000000.0f / trigger_rate_hz);
+
+    // Compute outlier threshold
+    uint32_t base_cycles = (uint32_t)(bcm_base_on_us * cycles_per_us);
+    uint32_t nominal_burst_cyc = 0;
+    for (int b = 0; b < bcm_bits; b++) {
+        nominal_burst_cyc += base_cycles * (1U << b) + PIO_ON_OVERHEAD_CYCLES + 30;
+    }
+    stat_outlier_threshold = nominal_burst_cyc * 2;
+
+    // For Mode C, we reuse the same single-SM PIO column program (led_col_program)
+    // since we don't need the MSM row SM (row is held by CPU).
+    // This makes Mode C functionally similar to Mode A but we DMA-feed the col SM.
+    // The key difference: DMA paces data via DREQ, reducing CPU involvement.
+
+    // Reset PIO SM
+    pio_sm_set_enabled(pio_hw_inst, pio_sm_idx, false);
+    pio_sm_clear_fifos(pio_hw_inst, pio_sm_idx);
+    pio_sm_restart(pio_hw_inst, pio_sm_idx);
+    pio_sm_exec(pio_hw_inst, pio_sm_idx, pio_encode_jmp(pio_offset));
+    pio_interrupt_clear(pio_hw_inst, 0);
+    pio_sm_set_enabled(pio_hw_inst, pio_sm_idx, true);
+    pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, 0xFFFFF);
+
+    // DMA channel
+    int dma_ch = dma_claim_unused_channel(false);
+    if (dma_ch < 0) {
+        Serial.println("ERR: No free DMA channel for BCM-C");
+        pio_sm_set_enabled(pio_hw_inst, pio_sm_idx, false);
+        return;
+    }
+
+    dma_channel_config dma_cfg = dma_channel_get_default_config(dma_ch);
+    channel_config_set_transfer_data_size(&dma_cfg, DMA_SIZE_32);
+    channel_config_set_read_increment(&dma_cfg, true);
+    channel_config_set_write_increment(&dma_cfg, false);
+    channel_config_set_dreq(&dma_cfg, pio_get_dreq(pio_hw_inst, pio_sm_idx, true));
+
+    // Warm-up
+    noInterrupts();
+    gpio_set_mask64(row_on_mask[0]);
+    dma_channel_configure(dma_ch, &dma_cfg,
+        &pio_hw_inst->txf[pio_sm_idx], &bcm_plane_data[0][0][0],
+        bcm_bits * 2, true);
+    for (int b = 0; b < bcm_bits; b++) {
+        while (!pio_interrupt_get(pio_hw_inst, 0)) {}
+        pio_interrupt_clear(pio_hw_inst, 0);
+    }
+    gpio_clr_mask64(row_on_mask[0]);
+    interrupts();
+
+    // Main trigger loop
+    uint32_t trigger_start = m33_hw->dwt_cyccnt;
+    uint8_t row = 0;
+
+    for (uint32_t t = 0; t < n_triggers; t++) {
+        while ((m33_hw->dwt_cyccnt - trigger_start) < trigger_period_cyc) {}
+        trigger_start += trigger_period_cyc;
+
+        noInterrupts();
+        uint32_t burst_start = m33_hw->dwt_cyccnt;
+
+        gpio_set_mask64(row_on_mask[row]);
+
+        // DMA feeds all bit-plane data
+        dma_channel_configure(dma_ch, &dma_cfg,
+            &pio_hw_inst->txf[pio_sm_idx], &bcm_plane_data[row][0][0],
+            bcm_bits * 2, true);
+
+        // Wait for all bit-planes to complete
+        for (int b = 0; b < bcm_bits; b++) {
+            while (!pio_interrupt_get(pio_hw_inst, 0)) {}
+            pio_interrupt_clear(pio_hw_inst, 0);
+        }
+
+        gpio_clr_mask64(row_on_mask[row]);
+        uint32_t burst_end = m33_hw->dwt_cyccnt;
+        interrupts();
+
+        stats_update(burst_end - burst_start, 0);
+
+        row++;
+        if (row >= active_rows) row = 0;
+
+        if ((t % 1000 == 999) && Serial.available()) {
+            Serial.print("  (interrupted at trigger ");
+            Serial.print(t + 1);
+            Serial.println(")");
+            break;
+        }
+    }
+
+    pio_sm_set_enabled(pio_hw_inst, pio_sm_idx, false);
+    dma_channel_unclaim(dma_ch);
+    all_off();
+}
+
+static void cmd_bcmburst(const char* arg) {
+    // Parse: BCMBURST <n_triggers> [rate_hz] [A|B|C]
+    uint32_t n = 10000;
+    float rate = 8000.0f;
+    char mode = 'A';
+
+    if (arg && *arg) {
+        char* end;
+        n = strtoul(arg, &end, 10);
+        if (n == 0 || n > 1000000) {
+            Serial.println("ERR: BCMBURST <1-1000000> [rate_hz] [A|B|C]");
+            return;
+        }
+        while (*end == ' ') end++;
+        if (*end && (*end >= '0' && *end <= '9')) {
+            rate = strtof(end, &end);
+            if (rate < 100.0f || rate > 100000.0f) {
+                Serial.println("ERR: rate must be 100-100000 Hz");
+                return;
+            }
+        }
+        while (*end == ' ') end++;
+        if (*end == 'A' || *end == 'B' || *end == 'C' ||
+            *end == 'a' || *end == 'b' || *end == 'c') {
+            mode = *end & ~0x20;  // uppercase
+        }
+    }
+
+    if (!pio_loaded && !pio_init_program()) return;
+
+    bool was_running = running;
+    running = false;
+    all_off();
+    col_pins_to_pio();
+
+    precompute_bcm_data();
+
+    // Compute expected burst time
+    uint32_t base_cycles = (uint32_t)(bcm_base_on_us * cycles_per_us);
+    float est_burst_us = 0;
+    for (int b = 0; b < bcm_bits; b++) {
+        est_burst_us += bcm_base_on_us * (1 << b) + 0.40f; // ~0.40 µs overhead per pass
+    }
+    float period_us = 1000000.0f / rate;
+
+    Serial.println("--- BCMBURST START ---");
+    Serial.print("BCM bits=");
+    Serial.print(bcm_bits);
+    Serial.print("  Base T=");
+    Serial.print(bcm_base_on_us, 3);
+    Serial.print("us  Rows=");
+    Serial.print(active_rows);
+    Serial.print("  Triggers=");
+    Serial.print(n);
+    Serial.print("  Mode=");
+    Serial.println(mode);
+    Serial.print("  Rate=");
+    Serial.print(rate, 1);
+    Serial.print("Hz  Period=");
+    Serial.print(period_us, 1);
+    Serial.print("us  Est burst=");
+    Serial.print(est_burst_us, 1);
+    Serial.print("us  Frame rate=");
+    Serial.print(rate / active_rows, 1);
+    Serial.println("Hz");
+
+    switch (mode) {
+        case 'A': run_bcm_burst_pio(n, rate); break;
+        case 'B': run_bcm_burst_dma(n, rate); break;
+        case 'C': run_bcm_burst_msm(n, rate); break;
+    }
+
+    // Stats
+    stats_print_fields("  BCM_BURST", "burst", nullptr);
+
+    if (stat_count > 0) {
+        float mean_burst = cycles_to_us((uint32_t)(stat_on_sum / stat_count));
+        Serial.print("  Duty cycle: ");
+        Serial.print(100.0f * mean_burst / period_us, 1);
+        Serial.println("%");
+        Serial.print("  Fits in 13us? ");
+        Serial.println(cycles_to_us(stat_on_max) <= 13.0f ? "YES" : "NO");
+        Serial.print("  Fits in 15us? ");
+        Serial.println(cycles_to_us(stat_on_max) <= 15.0f ? "YES" : "NO");
+    }
+
+    Serial.println("--- BCMBURST END ---");
+
+    col_pins_to_sio();
+    precompute_scan_masks();
+    stats_reset();
+    running = was_running;
+    if (running) count = 0;
+}
+
+static void cmd_bcm_set(const char* arg) {
+    int val = atoi(arg);
+    if (val < 1 || val > 8) {
+        Serial.println("ERR: BCM <1-8>");
+        return;
+    }
+    bcm_bits = val;
+    Serial.print("BCM bits=");
+    Serial.print(bcm_bits);
+    Serial.print("  Levels=");
+    Serial.println(1 << bcm_bits);
+}
+
+static void cmd_bcmon(const char* arg) {
+    float val = atof(arg);
+    if (val < 0.01f || val > 100.0f) {
+        Serial.println("ERR: BCMON <0.01-100> us");
+        return;
+    }
+    bcm_base_on_us = val;
+    Serial.print("BCM base T=");
+    Serial.print(bcm_base_on_us, 3);
+    Serial.println("us");
+}
+
+static void cmd_fill(const char* arg) {
+    int val = atoi(arg);
+    int max_val = (1 << bcm_bits) - 1;
+    if (val < 0) val = 0;
+    if (val > max_val) val = max_val;
+    for (int r = 0; r < PANEL_SIZE; r++)
+        for (int c = 0; c < PANEL_SIZE; c++)
+            pixel_data[r][c] = (uint8_t)val;
+    Serial.print("FILL ");
+    Serial.print(val);
+    Serial.print(" (max=");
+    Serial.print(max_val);
+    Serial.println(")");
+}
+
+static void cmd_gradient() {
+    int max_val = (1 << bcm_bits) - 1;
+    for (int r = 0; r < PANEL_SIZE; r++)
+        for (int c = 0; c < PANEL_SIZE; c++)
+            pixel_data[r][c] = (uint8_t)((r * max_val) / (PANEL_SIZE - 1));
+    Serial.print("GRADIENT set (row-varying, 0-");
+    Serial.print(max_val);
+    Serial.println(")");
+}
+
+// ---------------------------------------------------------------------------
 
 static char     cmd_buf[64];
 static uint8_t  cmd_len = 0;
@@ -2066,6 +2573,13 @@ static void cmd_help() {
     Serial.println("== Burst Mode (2P sync simulation) ==");
     Serial.println("BURST <N> [Hz]   Burst scan at trigger rate (default 8000 Hz)");
     Serial.println("                 noInterrupts during scan, free-running idle");
+    Serial.println("== BCM Burst Mode (Phase 4) ==");
+    Serial.println("BCM <bits>       Set BCM bit depth (1-8, default 4)");
+    Serial.println("BCMON <us>       Set BCM base time T (default 0.5 us)");
+    Serial.println("FILL <intensity> Fill all pixels with value");
+    Serial.println("GRADIENT         Row-varying intensity gradient");
+    Serial.println("BCMBURST <N> [Hz] [A|B|C]  BCM burst scan");
+    Serial.println("                 A=PIO, B=DMA, C=MSM (default A, 8000 Hz)");
     Serial.println("REBOOT           Reboot into BOOTSEL (USB flash) mode");
     Serial.println("HELP             This message");
 }
@@ -2680,6 +3194,16 @@ static void process_command() {
         running = was_running;
     } else if (strcmp(cmd_buf, "MSMSCAN") == 0 && args) {
         cmd_msmscan(args);
+    } else if (strcmp(cmd_buf, "BCM") == 0 && args) {
+        cmd_bcm_set(args);
+    } else if (strcmp(cmd_buf, "BCMON") == 0 && args) {
+        cmd_bcmon(args);
+    } else if (strcmp(cmd_buf, "FILL") == 0 && args) {
+        cmd_fill(args);
+    } else if (strcmp(cmd_buf, "GRADIENT") == 0) {
+        cmd_gradient();
+    } else if (strcmp(cmd_buf, "BCMBURST") == 0) {
+        cmd_bcmburst(args);
     } else if (strcmp(cmd_buf, "REBOOT") == 0) {
         Serial.println("Rebooting into BOOTSEL mode...");
         Serial.flush();
