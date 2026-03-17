@@ -1,0 +1,42 @@
+{
+  "0.25": {
+    "frame_min": "17.233",
+    "frame_max": "20.587",
+    "frame_mean": "17.233",
+    "row_min": "0.860",
+    "row_mean": "0.860",
+    "jitter_us": "3.353",
+    "duty_cycle": "13.8",
+    "fits_15us": false
+  },
+  "0.5": {
+    "frame_min": "22.567",
+    "frame_max": "22.567",
+    "frame_mean": "22.567",
+    "row_min": "1.127",
+    "row_mean": "1.127",
+    "jitter_us": "0.000",
+    "duty_cycle": "18.1",
+    "fits_15us": false
+  },
+  "0.75": {
+    "frame_min": "27.233",
+    "frame_max": "27.233",
+    "frame_mean": "27.233",
+    "row_min": "1.360",
+    "row_mean": "1.360",
+    "jitter_us": "0.000",
+    "duty_cycle": "21.8",
+    "fits_15us": false
+  },
+  "1.0": {
+    "frame_min": "32.567",
+    "frame_max": "32.567",
+    "frame_mean": "32.567",
+    "row_min": "1.627",
+    "row_mean": "1.627",
+    "jitter_us": "0.000",
+    "duty_cycle": "26.1",
+    "fits_15us": false
+  }
+}

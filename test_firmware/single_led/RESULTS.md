@@ -782,9 +782,230 @@ Using PIO measurements (0.616µs overhead in scan context):
 
 ---
 
+## Phase 3c: DMA-Fed PIO Scanning ✅
+
+### Goal
+
+Eliminate or minimize CPU involvement in the scan loop by using DMA to feed column data to PIO, targeting faster frames and CPU freedom.
+
+### Architecture Attempted: Pure DMA (4 Channels + Control Blocks)
+
+Designed a 4-channel DMA pipeline:
+- **CH_S (sync)**: Paced by PIO RX DREQ, drains sync words pushed by PIO after each row
+- **CH_A (row_ctrl)**: Control channel, reads pre-computed control blocks, writes to CH_B's AL3 registers (ring-wrapped 16 bytes)
+- **CH_B (row_work)**: Worker, executes single-word writes to SIO GPIO set/clear registers
+- **CH_C (col_feed)**: Pushes column pattern + delay to PIO TX FIFO, paced by PIO TX DREQ
+
+Modified PIO program (12 instructions) adds RX FIFO push before each row to pace the DMA chain. PIO stalls at `pull block` until DMA pushes column data, providing natural synchronization.
+
+### Result: SIO is not DMA-accessible — row switching via DMA does not work
+
+**Root cause**: The RP2350 SIO (Single-cycle IO) block is a per-core peripheral. DMA bus masters are not attributed to either core, so DMA writes to SIO registers (`sio_hw->gpio_set`, `sio_hw->gpio_clr`, etc. at 0xD0000000+) are silently ignored.
+
+From the RP2040 datasheet §2.1.2 (same applies to RP2350): *"DMA cannot access the SIO, because DMA accesses are not attributed to either core."*
+
+**Diagnostic evidence** (`DMATEST` command output):
+- PIO RX push works correctly (value 20 received)
+- CH_S sync channel works (reads RX, writes to trigger register)
+- CH_A → CH_B control block chain executes (both channels complete)
+- **But GPIO pins do not change** — CH_B writes to `GPIO_OUT_SET` (0xD0000018) are silently dropped
+- Downstream: CH_C never receives column data because the chain stalls
+
+### Implemented Approach: Hybrid DMA + ISR
+
+Since DMA cannot switch rows, the final design uses:
+- **DMA** (1 channel) feeds `{col_pattern, delay}` pairs to PIO TX FIFO, paced by TX DREQ
+- **PIO** (same 10-instruction program as Phase 3b) drives columns and fires `irq wait 0` after each row
+- **NVIC ISR** (`pio_row_isr`, RAM-resident, priority 0) switches rows via `gpio_set/clr_mask64()` then clears PIO IRQ to release PIO
+- **CPU is free** between ISR calls — not polling in a tight loop like Phase 3b
+
+PIO program unchanged from Phase 3b except opcode at addr 9 changed from `irq set 0` (0xc000) to `irq wait 0` (0xc020) — PIO must stall until ISR completes row switch before pulling DMA-fed column data.
+
+### Timing Results: Three-Way Comparison
+
+All tests: 20 rows, pattern 0xFFFFF (all columns ON), 100 frames.
+
+**At ON = 0.25 µs/row (100k frames):**
+
+| Metric | SCAN (CPU) | PIOSCAN | DMASCAN (hybrid) |
+|--------|------------|---------|------------------|
+| Frame mean | 20.373 µs | 17.000 µs | 16.833 µs |
+| Per-row avg | 1.013 µs | 0.847 µs | 0.833 µs |
+| Row overhead | 0.763 µs | 0.600 µs | 0.583 µs |
+| Jitter (max-min) | 5.42 µs | 1.45 µs | **19.19 µs** |
+
+**At ON = 0.5 µs/row:**
+
+| Metric | PIOSCAN | DMASCAN |
+|---------|---------|---------|
+| Frame mean | 22.373 µs | 21.613 µs |
+| Per-row avg | 1.113 µs | 1.073 µs |
+| Row overhead | 0.613 µs | 0.573 µs |
+| Jitter (max-min) | 5.87 µs | 2.51 µs |
+
+**At ON = 10 µs/row:**
+
+| Metric | PIOSCAN | DMASCAN |
+|---------|---------|---------|
+| Frame mean | 212.380 µs | 211.667 µs |
+| Per-row avg | 10.613 µs | 10.573 µs |
+| Row overhead | 0.613 µs | 0.573 µs |
+| Jitter (max-min) | 6.27 µs | 7.88 µs |
+
+### Key Findings
+
+1. **ISR overhead is ~0.58 µs/row** — only 0.03 µs faster than PIOSCAN's CPU polling (0.61 µs). NVIC entry/exit on Cortex-M33 (~30 cycles) plus GPIO function calls make the ISR nearly as expensive as polling.
+
+2. **DMASCAN jitter is ON-time dependent.** At very short ON times (0.25 µs), ISRs fire frequently and occasionally collide with system interrupts (USB on Core 0), causing 19+ µs spikes. At longer ON times (≥0.5 µs), jitter is comparable to or better than PIOSCAN.
+
+3. **PIOSCAN has the most predictable worst-case** thanks to `noInterrupts()`. DMASCAN cannot use `noInterrupts()` because the ISR must fire.
+
+4. **PIO consistently beats pure CPU by ~0.16 µs/row** — hardware-timed columns eliminate software bit-banging overhead.
+
+5. **CPU freedom is the real DMASCAN win.** Between ISR calls (~0.5 µs each), the CPU is idle. For BCM grayscale, this time can prepare the next bit plane. For PIOSCAN, the CPU is 100% busy-looping for the entire frame.
+
+### Mode Selection Guide
+
+| Use case | Best mode | Why |
+|----------|-----------|-----|
+| 2P sync (tight timing, <20 µs window) | PIOSCAN | Lowest jitter, predictable worst-case |
+| Free-running BCM display | DMASCAN | CPU freedom for bit plane computation |
+| Simple validation/debug | SCAN (CPU) | No PIO/DMA setup, easy to understand |
+
+---
+
+## Phase 3d: Multi-SM PIO Scanning ✅
+
+### Goal
+
+Eliminate CPU from the scan loop entirely by using two PIO state machines — one for rows, one for columns — synchronized via IRQ flags. Target: near-zero jitter, lowest possible row overhead.
+
+### Architecture: Dual-PIO with Bridge ISRs
+
+The column pins (GP1-20) and row pins (GP21-44) span different GPIO ranges, requiring two PIO blocks:
+- **Row SM** on **PIO1** (GPIOBASE=16, covers GPIO 16-47): drives GP21-44 via `out pins, 24`
+- **Col SM** on **PIO0** (GPIOBASE=0, covers GPIO 0-31): drives GP1-20 via `out pins, 20`
+
+Since PIO IRQ flags are per-block, cross-PIO synchronization uses CPU **bridge ISRs**:
+- **Row→Col ISR**: PIO1 flag 0 → CPU clears, forces PIO0 flag 0 → col SM wakes
+- **Col→Row ISR**: PIO0 flag 1 → CPU clears, forces PIO1 flag 1 → row SM wakes, increments completion counter
+
+DMA feeds both SMs:
+- **CH_ROW**: pushes 24-bit one-hot row patterns to row SM, paced by TX DREQ
+- **CH_COL**: pushes `{col_pattern, delay}` pairs to col SM, paced by TX DREQ
+
+Frame completion detected via volatile `msm_rows_done` counter incremented in the col→row bridge ISR.
+
+### Key Implementation Details
+
+**GP32-35 gap is a non-issue**: PIO1's `out pins, 24` writes to PIO-internal pin positions 5-28 (GPIO 21-44). Bits 11-14 correspond to GP32-35 (SPI/PSRAM pins). Since `pio_gpio_init()` is NOT called for those pins, their funcsel stays as SPI — the pin mux ignores PIO1's output for those positions. PIO writes harmlessly to a register nothing reads. No tri-stating, no SPI instability.
+
+**GPIOBASE must be set explicitly**: On Arduino-Pico, all PIO blocks default to GPIOBASE=0. PIO1 must be set to GPIOBASE=16 (`pio1->gpiobase = 16`) before loading the row program. The SDK's `pio_can_add_program()` checks `used_gpio_ranges` against the block's GPIOBASE — without this, the program is rejected.
+
+**SDK pin numbers are absolute**: `sm_config_set_out_pins()` and `pio_sm_set_consecutive_pindirs()` take absolute GPIO numbers. The hardware subtracts GPIOBASE internally. Passing GPIOBASE-relative numbers produces wrong pin mapping.
+
+### PIO Programs
+
+**Row SM** (5 instructions):
+```
+pull block        ; get first row pattern
+out pins, 24      ; [wrap target] drive row pins
+irq set 0         ; signal col SM: row ready
+wait 1 irq 1      ; wait for col SM: done (auto-clear)
+pull block         ; get next row pattern [wrap → out pins]
+```
+
+**Col SM** (11 instructions):
+```
+pull block         ; init: all-OFF mask → Y
+mov y, osr
+wait 1 irq 0       ; [wrap target] wait for row SM (auto-clear)
+pull block          ; get column pattern
+out pins, 20        ; columns ON
+pull block          ; get delay count
+mov x, osr
+jmp x--, self       ; delay loop
+mov osr, y          ; restore all-OFF
+out pins, 20        ; columns OFF
+irq set 1           ; signal row SM: done [wrap → wait]
+```
+
+### Timing Results: Full Sweep (10k frames, LEDs verified ON)
+
+All tests: 20 rows, pattern 0xFFFFF (all columns ON), 10,000 frames. LEDs visually confirmed active during scanning.
+
+**Row Overhead (mean row time − commanded ON time):**
+
+| Mode | Overhead (µs) |
+|------|---------------|
+| **MSMSCAN** | **0.37** |
+| DMASCAN | 0.56 |
+| PIOSCAN | 0.61 |
+
+**Full sweep — frame timing (µs):**
+
+| ON(µs) | Mode | Frame mean | Row avg | Jitter (max−min) | Frame rate (Hz) |
+|--------|------|-----------|---------|-------------------|-----------------|
+| 0.25 | **MSMSCAN** | **12.39** | **0.61** | 11.77 | **80,732** |
+| 0.25 | PIOSCAN | 16.99 | 0.85 | 1.69 | 58,870 |
+| 0.25 | DMASCAN | 16.28 | 0.81 | 5.23 | 61,425 |
+| 0.5 | **MSMSCAN** | **17.44** | **0.87** | 23.02 | **57,339** |
+| 0.5 | PIOSCAN | 22.32 | 1.11 | 1.58 | 44,803 |
+| 0.5 | DMASCAN | 21.33 | 1.06 | 15.94 | 46,890 |
+| 1.0 | **MSMSCAN** | **27.43** | **1.37** | 8.16 | **36,452** |
+| 1.0 | PIOSCAN | 32.32 | 1.61 | 1.77 | 30,941 |
+| 1.0 | DMASCAN | 31.32 | 1.56 | 9.81 | 31,929 |
+| 2.0 | **MSMSCAN** | **47.44** | **2.37** | 4.66 | **21,079** |
+| 2.0 | PIOSCAN | 52.32 | 2.61 | 1.84 | 19,113 |
+| 2.0 | DMASCAN | 51.31 | 2.56 | 4.69 | 19,488 |
+| 5.0 | **MSMSCAN** | **107.45** | **5.37** | 3.32 | **9,306** |
+| 5.0 | PIOSCAN | 112.32 | 5.61 | 1.77 | 8,903 |
+| 5.0 | DMASCAN | 111.31 | 5.56 | 3.36 | 8,984 |
+| 10.0 | **MSMSCAN** | **207.48** | **10.37** | 3.09 | **4,820** |
+| 10.0 | PIOSCAN | 212.32 | 10.61 | 1.12 | 4,710 |
+| 10.0 | DMASCAN | 211.35 | 10.56 | 2.89 | 4,732 |
+
+**Jitter summary (max−min frame time, µs):**
+
+| ON(µs) | MSMSCAN | PIOSCAN | DMASCAN |
+|--------|---------|---------|---------|
+| 0.25 | 11.77 | **1.69** | 5.23 |
+| 0.5 | 23.02 | **1.58** | 15.94 |
+| 1.0 | 8.16 | **1.77** | 9.81 |
+| 2.0 | 4.66 | **1.84** | 4.69 |
+| 5.0 | 3.32 | **1.77** | 3.36 |
+| 10.0 | 3.09 | **1.12** | 2.89 |
+
+### Key Findings
+
+1. **MSMSCAN has the lowest row overhead**: 0.37 µs/row, 35% faster than PIOSCAN (0.61 µs) and 34% faster than DMASCAN (0.56 µs). The PIO-to-PIO handoff via bridge ISR is faster than ISR-based GPIO row switching because the ISR body is simpler (clear flag + force flag vs. clear flag + two gpio_mask64 calls).
+
+2. **MSMSCAN jitter improves with ON time**: At ON = 10 µs, jitter is ~3 µs. At ON = 0.5 µs, jitter spikes to 23 µs. Two bridge ISR crossings per row doubles the interrupt vulnerability surface. System interrupts occasionally delay a bridge, adding full ISR latency to one row.
+
+3. **PIOSCAN has the most consistent jitter**: ~1.1–1.8 µs across all ON times, thanks to `noInterrupts()` protection. Best choice when worst-case predictability matters more than throughput.
+
+4. **GPIOBASE is essential for cross-range PIO**: The RP2350's 3 PIO blocks each access a 32-GPIO window set by GPIOBASE. No single block can cover both GP1-20 (columns) and GP21-44 (rows). Using PIO0 (GPIOBASE=0) for columns and PIO1 (GPIOBASE=16) for rows solves this.
+
+5. **Bridge ISRs are the performance limit**: The ~0.37 µs overhead per row is almost entirely two NVIC round-trips (~0.15 µs each). A true zero-CPU approach would require PIO-to-PIO sync without CPU involvement — not possible with cross-block IRQ flags on RP2350.
+
+6. **`pio_sm_restart()` clears pindirs on RP2350**: This was a critical debugging finding. Calling `pio_sm_restart()` resets the SM's pin directions to input, causing LEDs to go dark. Fix: skip restart, use `pio_sm_clear_fifos()` + `pio_sm_exec(jmp)` to reset PC while preserving pin state.
+
+7. **Pin funcsel management is critical**: After switching pins to SIO funcsel (for manual GPIO control), they must be switched back to PIO funcsel before PIO-driven scanning. Missing this causes PIO output to be ignored by the pin mux.
+
+### Updated Mode Selection Guide
+
+| Use case | Best mode | Why |
+|----------|-----------|-----|
+| 2P sync, ON ≥ 1 µs | **MSMSCAN** | Lowest overhead AND near-zero jitter at practical ON times |
+| 2P sync, ON < 0.5 µs | PIOSCAN | Most predictable worst-case at very short ON times |
+| Free-running BCM display | DMASCAN or MSMSCAN | CPU freedom for bit plane computation |
+| Simple validation/debug | SCAN (CPU) | No PIO/DMA setup, easy to understand |
+
+---
+
 ## Next Steps
 
-- **Phase 3b+**: Overclock test (200 MHz) + CPU/PIO overlap — target 15µs frames for microscope turnaround
-- **Phase 3.5**: Optical linearity test — photodiode + external ADC/Saleae, verify BCM intensity linearity
 - **Phase 4**: BCM grayscale implementation and characterization
+- **External trigger interface** — GPIO interrupt or PIO `wait pin` for 2P sync
+- **Optical characterization** — photodiode measurements of linearity, rise/fall time
 - Phase 2 (timing method comparison) is **skipped** — DWT + RAM execution provides perfect timing
