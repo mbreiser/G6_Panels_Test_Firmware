@@ -1,0 +1,162 @@
+count: 386730  ON=10.000us OFF=40.000us
+count: 405139  ON=10.000us OFF=40.000us
+count: 423550  ON=10.000us OFF=40.000us
+count: 441961  ON=10.000us OFF=40.000us
+count: 460371  ON=10.000us OFF=40.000us
+count: 478782  ON=10.000us OFF=40.000us
+count: 497192  ON=10.000us OFF=40.000us
+count: 515602  ON=10.000us OFF=40.000us
+count: 534013  ON=10.000us OFF=40.000us
+count: 552424  ON=10.000us OFF=40.000us
+STOPPED
+--- ROWTIME START ---
+Rows=20  Pattern=0xFFFFF  Iterations=10000
+(Measuring row-switch overhead only, no delay)
+  ROW_OVERHEAD  N=200000
+  per_row: min=0.647us  max=4.040us  mean=0.647us
+  Est frame overhead (20 rows): 12.933us
+  At 8kHz (125us/frame): 112.067us available for LED ON time
+--- ROWTIME END ---
+--- SCAN START ---
+Rows=20  ON/row=0.500us (75 cyc)  Pattern=0xFFFFF  Frames=10000
+  FRAME_TIME  N=10000
+  frame: min=25.647us  max=30.253us  mean=25.647us
+  row_avg: min=1.280us  max=1.507us  mean=1.280us
+  Frame rate: 38991.4 Hz (25.647us/frame)
+--- SCAN END ---
+--- SCAN START ---
+Rows=20  ON/row=1.000us (150 cyc)  Pattern=0xFFFFF  Frames=10000
+  FRAME_TIME  N=10000
+  frame: min=35.247us  max=36.367us  mean=35.247us
+  row_avg: min=1.760us  max=1.813us  mean=1.760us
+  Frame rate: 28371.5 Hz (35.247us/frame)
+--- SCAN END ---
+--- SCAN START ---
+Rows=20  ON/row=2.000us (300 cyc)  Pattern=0xFFFFF  Frames=10000
+  FRAME_TIME  N=10000
+  frame: min=55.247us  max=55.247us  mean=55.247us
+  row_avg: min=2.760us  max=2.760us  mean=2.760us
+  Frame rate: 18100.6 Hz (55.247us/frame)
+--- SCAN END ---
+--- SCAN START ---
+Rows=20  ON/row=5.000us (750 cyc)  Pattern=0xFFFFF  Frames=10000
+  FRAME_TIME  N=10000
+  frame: min=115.247us  max=115.980us  mean=115.247us
+  row_avg: min=5.760us  max=5.793us  mean=5.760us
+  Frame rate: 8677.0 Hz (115.247us/frame)
+--- SCAN END ---
+PIO OK: pio2 sm0
+--- PIOROWTIME START ---
+Rows=20  Pattern=0xFFFFF  Iterations=10000
+(Measuring PIO row-switch overhead, min delay)
+  PIO_ROW_OVERHEAD  N=200000
+  per_row: min=0.593us  max=28.867us  mean=0.593us
+  Est frame overhead (20 rows): 11.867us
+  At 8kHz (125us/frame): 113.133us available for LED ON time
+--- PIOROWTIME END ---
+--- PIOROWTIME START ---
+Rows=1  Pattern=0xFFFFF  Iterations=10000
+(Measuring PIO row-switch overhead, min delay)
+  PIO_ROW_OVERHEAD  N=10000
+  per_row: min=0.593us  max=6.920us  mean=0.593us
+  Est frame overhead (1 rows): 0.593us
+  At 8kHz (125us/frame): 124.407us available for LED ON time
+--- PIOROWTIME END ---
+--- PIOSCAN START ---
+Rows=20  ON/row=0.500us cmd (0.500us PIO actual, delay=70)  Pattern=0xFFFFF  Frames=10000  Mode=protected
+  FRAME_TIME  N=10000
+  frame: min=22.320us  max=26.993us  mean=22.320us
+  row_avg: min=1.113us  max=1.347us  mean=1.113us
+  Frame rate: 44802.9 Hz (22.320us/frame)
+--- PIOSCAN END ---
+--- PIOSCAN START ---
+Rows=20  ON/row=1.000us cmd (1.000us PIO actual, delay=145)  Pattern=0xFFFFF  Frames=10000  Mode=protected
+  FRAME_TIME  N=10000
+  frame: min=32.320us  max=33.040us  mean=32.320us
+  row_avg: min=1.613us  max=1.647us  mean=1.613us
+  Frame rate: 30940.6 Hz (32.320us/frame)
+--- PIOSCAN END ---
+--- PIOSCAN START ---
+Rows=20  ON/row=2.000us cmd (2.000us PIO actual, delay=295)  Pattern=0xFFFFF  Frames=10000  Mode=protected
+  FRAME_TIME  N=10000
+  frame: min=52.320us  max=52.320us  mean=52.320us
+  row_avg: min=2.613us  max=2.613us  mean=2.613us
+  Frame rate: 19113.2 Hz (52.320us/frame)
+--- PIOSCAN END ---
+--- PIOSCAN START ---
+Rows=20  ON/row=5.000us cmd (5.000us PIO actual, delay=745)  Pattern=0xFFFFF  Frames=10000  Mode=protected
+  FRAME_TIME  N=10000
+  frame: min=112.320us  max=112.320us  mean=112.320us
+  row_avg: min=5.613us  max=5.613us  mean=5.613us
+  Frame rate: 8903.1 Hz (112.320us/frame)
+--- PIOSCAN END ---
+--- PIOSCAN START ---
+Rows=20  ON/row=1.000us cmd (1.000us PIO actual, delay=145)  Pattern=0xFFFFF  Frames=10000  Mode=unprotected
+  FRAME_TIME  N=10000
+  frame: min=32.307us  max=42.633us  mean=32.413us
+  row_avg: min=1.613us  max=2.127us  mean=1.613us
+  Frame rate: 30851.5 Hz (32.413us/frame)
+--- PIOSCAN END ---
+--- PIOSCAN START ---
+Rows=1  ON/row=1.000us cmd (1.000us PIO actual, delay=145)  Pattern=0xFFFFF  Frames=10000  Mode=protected
+  FRAME_TIME  N=10000
+  frame: min=1.667us  max=1.667us  mean=1.667us
+  row_avg: min=1.667us  max=1.667us  mean=1.667us
+  Frame rate: 600000.0 Hz (1.667us/frame)
+--- PIOSCAN END ---
+--- PIOSCAN START ---
+Rows=5  ON/row=1.000us cmd (1.000us PIO actual, delay=145)  Pattern=0xFFFFF  Frames=10000  Mode=protected
+  FRAME_TIME  N=10000
+  frame: min=8.120us  max=8.120us  mean=8.120us
+  row_avg: min=1.620us  max=1.620us  mean=1.620us
+  Frame rate: 123152.7 Hz (8.120us/frame)
+--- PIOSCAN END ---
+--- PIOSCAN START ---
+Rows=10  ON/row=1.000us cmd (1.000us PIO actual, delay=145)  Pattern=0xFFFFF  Frames=10000  Mode=protected
+  FRAME_TIME  N=10000
+  frame: min=16.187us  max=16.187us  mean=16.187us
+  row_avg: min=1.613us  max=1.613us  mean=1.613us
+  Frame rate: 61779.2 Hz (16.187us/frame)
+--- PIOSCAN END ---
+--- PIOSCAN START ---
+Rows=15  ON/row=1.000us cmd (1.000us PIO actual, delay=145)  Pattern=0xFFFFF  Frames=10000  Mode=protected
+  FRAME_TIME  N=10000
+  frame: min=24.253us  max=24.253us  mean=24.253us
+  row_avg: min=1.613us  max=1.613us  mean=1.613us
+  Frame rate: 41231.4 Hz (24.253us/frame)
+--- PIOSCAN END ---
+--- PIOSCAN START ---
+Rows=20  ON/row=1.000us cmd (1.000us PIO actual, delay=145)  Pattern=0xFFFFF  Frames=10000  Mode=protected
+  FRAME_TIME  N=10000
+  frame: min=32.320us  max=32.320us  mean=32.320us
+  row_avg: min=1.613us  max=1.613us  mean=1.613us
+  Frame rate: 30940.6 Hz (32.320us/frame)
+--- PIOSCAN END ---
+--- PIOSCAN START ---
+Rows=20  ON/row=1.000us cmd (1.000us PIO actual, delay=145)  Pattern=0xFFFFF  Frames=10000  Mode=protected
+  FRAME_TIME  N=10000
+  frame: min=32.320us  max=32.320us  mean=32.320us
+  row_avg: min=1.613us  max=1.613us  mean=1.613us
+  Frame rate: 30940.6 Hz (32.320us/frame)
+--- PIOSCAN END ---
+--- PIOSCAN START ---
+Rows=20  ON/row=1.000us cmd (1.000us PIO actual, delay=145)  Pattern=0x0  Frames=10000  Mode=protected
+  FRAME_TIME  N=10000
+  frame: min=32.320us  max=32.320us  mean=32.320us
+  row_avg: min=1.613us  max=1.613us  mean=1.613us
+  Frame rate: 30940.6 Hz (32.320us/frame)
+--- PIOSCAN END ---
+--- PIOSCAN START ---
+Rows=20  ON/row=1.000us cmd (1.000us PIO actual, delay=145)  Pattern=0xAAAAA  Frames=10000  Mode=protected
+  FRAME_TIME  N=10000
+  frame: min=32.320us  max=32.320us  mean=32.320us
+  row_avg: min=1.613us  max=1.613us  mean=1.613us
+  Frame rate: 30940.6 Hz (32.320us/frame)
+--- PIOSCAN END ---
+--- PIOSCAN START ---
+Rows=20  ON/row=1.000us cmd (1.000us PIO actual, delay=145)  Pattern=0x1  Frames=10000  Mode=protected
+  FRAME_TIME  N=10000
+  frame: min=32.320us  max=32.320us  mean=32.320us
+  row_avg: min=1.613us  max=1.613us  mean=1.613us
+  Frame rate: 30940.6 Hz (32.320us/frame)
+--- PIOSCAN END ---
