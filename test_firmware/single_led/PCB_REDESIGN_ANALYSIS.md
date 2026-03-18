@@ -79,7 +79,7 @@ The G6 panels exist in two LED polarity configurations:
 - **Column LOW + Row HIGH = LED ON** (anode on row, cathode on column)
 - This is the convention used in our test firmware. Column patterns are inverted before PIO output (`pio_col_word = (~pattern) & 0xFFFFF`)
 
-**Important**: The iorodeo firmware was developed for their normal-polarity panels. It does NOT confirm reversed polarity. Our Janelia batch panels are reversed, which we discovered during Phase 1 testing. A future PCB revision should document which polarity the assembled panels use.
+**Important**: The iorodeo firmware was developed for their normal-polarity panels. Our Janelia batch panels are reversed, which we discovered during Phase 1 testing. A future PCB revision should document which polarity the assembled panels use.
 
 ### 2.2 Impact on PIO Column Driving
 
@@ -88,9 +88,22 @@ The G6 panels exist in two LED polarity configurations:
 | Normal (iorodeo) | Bit = 1 (HIGH) | `0x00000` | `out pins, 20` directly |
 | **Reversed (Janelia batch)** | Bit = 0 (LOW) | `0xFFFFF` | Invert in software before push, or use `mov pins, ~osr` in PIO |
 
-**Conclusion: LED polarity is a trivial software concern.** One XOR or one PIO instruction handles either polarity. It does not constrain pin assignment or PIO architecture.
+**Conclusion: LED polarity is a trivial software concern** for the PIO column pattern — one XOR or one PIO instruction handles either convention. It does not constrain pin assignment or PIO architecture.
 
-### 2.3 Impact on PIO Row Driving
+### 2.3 Impact on Current Sourcing/Sinking
+
+In a passive LED matrix, the anode side must **source** current and the cathode side must **sink** current. The active row carries the aggregated current of all lit columns (up to 20× a single LED's current), so the row driver must handle higher peak current regardless of polarity.
+
+| Polarity | Column role | Row role | Row peak current |
+|----------|-----------|---------|-----------------|
+| Normal (iorodeo) | Source (HIGH = ON) | Sink (LOW = ON) | Up to 20× I_LED (sinking) |
+| **Reversed (Janelia)** | Sink (LOW = ON) | Source (HIGH = ON) | Up to 20× I_LED (sourcing) |
+
+**Hardware impact**: The UCC27517 gate driver is a push-pull output stage that can both source and sink current. However, its source and sink resistance differ slightly (datasheet: R_OH vs R_OL). This means brightness may vary slightly between the two polarity conventions for the same drive conditions, though the effect should be small given the UCC27517's low output impedance in both directions.
+
+**The G6 PCB has UCC27517 drivers on ALL 40 LED pins** (20 column + 20 row), confirmed from the hardware schematic (`drivers.kicad_sch`). The driver placement is fully symmetric, so neither polarity convention is disadvantaged from a current-handling perspective. Both sides can source and sink the required current.
+
+### 2.4 Impact on PIO Row Driving
 
 For rows, only one row is active at a time:
 
@@ -99,7 +112,14 @@ For rows, only one row is active at a time:
 | Normal (iorodeo) | LOW (one-cold) | One `0` in field of `1`s | `gpio_put(row, 0)` for ON, `gpio_put(row, 1)` for OFF |
 | **Reversed (Janelia)** | HIGH (one-hot) | One `1` in field of `0`s | `gpio_set_mask64` for ON, `gpio_clr_mask64` for OFF |
 
-Again, trivially handled in software. No architectural impact.
+Trivially handled in software. No architectural impact.
+
+### 2.5 Polarity Summary
+
+LED polarity affects:
+- **Software**: Column pattern inversion (one XOR per 32-bit word) and row ON/OFF sense — trivial
+- **Hardware**: Slight asymmetry in UCC27517 source vs sink resistance — negligible given symmetric driver placement
+- **Architecture**: No impact on pin assignment, PIO usage, or scanning strategy
 
 ---
 
@@ -147,9 +167,9 @@ SPI peripherals can only be mapped to specific GPIO groups (funcsel repeats ever
 
 ## 4. Redesign Options
 
-### 4.1 Option A: Minimal Change (Bodge Wire Only)
+### 4.1 Option A: Bodge Wire (Current Boards)
 
-**Change**: Wire EINT header to GP45 on MCU. No PCB re-route.
+**Change**: Hand-solder a wire from EINT header (J3-1 or J5-1) to GP45 pad on MCU. No PCB modification.
 
 ```
 GP0         XIP_CS1n (PSRAM)
@@ -166,22 +186,61 @@ GP46-47     Spare
 | Columns | ✅ Contiguous (GP1-20), PIO0 `out pins, 20` |
 | Rows | ⚠️ Split (GP21-31 + GP36-44), CPU `gpio_mask64` only |
 | SPI | ✅ Hardware SPI0 on GP32-35 |
-| EINT | ✅ Routed to GP45 |
+| EINT | ✅ Routed to GP45 (hand-wired) |
 | PIO row driving | ⚠️ Possible but writes through SPI pins (fragile) |
-| Effort | Trivial — one wire |
+| Effort | Trivial — one wire, no PCB fab |
 
-**Best for**: Current boards. Gets EINT working immediately with zero risk.
+**Best for**: Immediate testing on current boards. Gets EINT working with zero risk.
 
-### 4.2 Option B: Optimal Redesign (SPI1 on GP44-47)
+### 4.2 Option B: Minimal PCB Change (Add EINT Trace + Spare Pin Headers)
 
-**Change**: Move SPI from SPI0 (GP32-35) to SPI1 (GP44-47). Make rows fully contiguous.
+**Change**: Add a PCB trace from EINT to GP45 and break out GP45-47 to test points or a header. No rerouting of existing signals. All existing pin assignments stay identical.
+
+```
+GP0         XIP_CS1n (PSRAM)
+GP1-20      Column pins (unchanged)
+GP21-31     Row pins lower (unchanged)
+GP32-35     SPI0 (unchanged)
+GP36-44     Row pins upper (unchanged)
+GP45        EINT (external trigger)       ← NEW: trace from EINT header
+GP46        Sync output (active during scan burst) ← NEW: optional header
+GP47        Debug / spare                 ← NEW: optional header
+```
+
+| Aspect | Assessment |
+|--------|------------|
+| Columns | ✅ Contiguous (GP1-20), PIO0 `out pins, 20` |
+| Rows | ⚠️ Split (GP21-31 + GP36-44), same as current |
+| SPI | ✅ Hardware SPI0 on GP32-35 (unchanged) |
+| EINT | ✅ GP45, proper PCB trace |
+| PIO row driving | ⚠️ Same limitation as current (writes through SPI pins) |
+| Arena controller | No change needed |
+| Firmware | No SPI changes needed — just add trigger input code |
+| Effort | **Minimal** — add 1 trace + optional headers. No rerouting. |
+
+**Recommended spare pin usage (GP45-47):**
+
+| Pin | Recommended Function | Rationale |
+|-----|---------------------|-----------|
+| **GP45** | **EINT (external trigger input)** | Primary need. Microscope trigger for 2P sync. Visible to PIO1 (GPIOBASE=16 covers GP16-47) for `wait pin` trigger. Also readable as CPU GPIO for polling. |
+| **GP46** | **Sync output (scan burst active)** | Drive HIGH during the ~10 µs scan burst, LOW during idle. Enables oscilloscope triggering to verify timing, measure actual jitter with external instruments, and confirm synchronization with microscope scan. Invaluable for system integration and debugging. |
+| **GP47** | **Frame-sync output or spare** | Pulse once per complete frame (every 20 triggers = every 2.5 ms at 400 Hz). Useful for verifying frame rate, triggering frame-synchronized data acquisition, or as a general-purpose debug/test point. |
+
+All three pins are in PIO1's range (GPIOBASE=16 covers GP16-47), so they can be driven by PIO state machines if needed, or used as simple CPU GPIO.
+
+**Best for**: Next PCB revision with minimum risk. Preserves all existing routing, adds essential functionality.
+
+### 4.3 Option C: Optimal Redesign (SPI1 on GP44-47, Contiguous Rows)
+
+**Change**: Move SPI from SPI0 (GP32-35) to SPI1 (GP44-47). Make rows fully contiguous GP21-40. Route EINT to GP41.
 
 ```
 GP0         XIP_CS1n (PSRAM)
 GP1-20      Column pins (20 contiguous)   → PIO0 out pins, 20
 GP21-40     Row pins (20 contiguous)      → PIO1 out pins, 20 (or CPU mask)
 GP41        EINT (external trigger)       → PIO1 wait pin / CPU GPIO
-GP42-43     Spare (sync output, debug)
+GP42        Sync output (burst active)
+GP43        Frame-sync output / spare
 GP44        SPI1_RX (MISO)
 GP45        SPI1_CSn (CS)
 GP46        SPI1_SCK (SCK)
@@ -195,10 +254,10 @@ GP47        SPI1_TX (MOSI)
 | SPI | ✅ Hardware SPI1 on GP44-47 (identical capability to SPI0) |
 | EINT | ✅ GP41, visible to PIO1 for `wait pin` and CPU for GPIO read |
 | PIO row driving | ✅ Clean — no SPI pins in the output range |
-| Spare pins | GP42-43 free for sync output, debug, or second trigger |
-| Firmware change | One line: `spi_init(spi0, ...)` → `spi_init(spi1, ...)` |
-| Arena controller change | Re-wire SPI to new pin positions (same signals, different header pins) |
-| Effort | PCB re-route + firmware update on both panel and controller |
+| Spare pins | GP42-43 for sync output and debug |
+| Firmware change | One line: `spi_init(spi0, ...)` → `spi_init(spi1, ...)` + pin constants |
+| Arena controller change | Re-wire SPI header to new pin positions |
+| Effort | Full PCB re-route + firmware update on both panel and controller |
 
 **PIO coverage verification:**
 ```
@@ -206,13 +265,15 @@ PIO0 (GPIOBASE=0):  GP0-31  → columns GP1-20 ✅  (also sees rows GP21-31)
 PIO1 (GPIOBASE=16): GP16-47 → rows GP21-40 ✅, EINT GP41 ✅, SPI GP44-47 (no conflict)
 ```
 
-**What this enables:**
+**What this enables beyond Option B:**
 1. **Fully autonomous PIO scanning** — PIO1 can drive all 20 row pins via `out pins, 20` with no CPU involvement during scan bursts. Combined with PIO0 driving columns, the entire scan could be PIO-only.
 2. **PIO1 `wait pin` for EINT** — GP41 is in PIO1's range. The trigger can wake a PIO state machine directly, enabling hardware-timed scan initiation with zero CPU latency.
 3. **No funcsel conflicts** — SPI pins are completely outside the row range. PIO1 row output and SPI can operate simultaneously without interference.
 4. **Simpler firmware** — No need for the GP32-35 gap workaround. Row precompute becomes a clean 20-bit mask instead of 24-bit with don't-care holes.
 
-### 4.3 Option C: Maximum PIO Autonomy (PIO-Based SPI)
+**Best for**: A future major revision where maximum PIO flexibility is desired and rerouting is acceptable.
+
+### 4.4 Option D: Maximum PIO Autonomy (PIO-Based SPI)
 
 **Change**: Replace hardware SPI with PIO-based SPI slave. Frees GP32-35 entirely.
 
@@ -237,13 +298,30 @@ GP46-47     Spare
 | Spare | GP46-47 (more free pins) |
 | Effort | PCB re-route + new PIO SPI slave program + validation |
 
-**Tradeoffs vs Option B:**
+**Tradeoffs vs Option C:**
 - **Pro**: SPI pin placement is fully flexible (any GPIO), frees GP32-35 for other uses
 - **Con**: Consumes a PIO state machine (3 SM remain across both PIO blocks instead of 4)
 - **Con**: PIO SPI slave at 25+ MHz is nontrivial to implement and validate — the iorodeo firmware already has a tested hardware SPI implementation with hot-plug resilience
-- **Con**: No practical benefit over Option B since GP32-35 aren't needed for anything else
+- **Con**: No practical benefit over Option C since GP32-35 aren't needed for anything else
 
-**Recommendation: Not worth the added complexity.** Option B achieves all the same pin layout benefits with proven hardware SPI.
+**Recommendation: Not worth the added complexity.** Option C achieves all the same pin layout benefits with proven hardware SPI.
+
+---
+
+## 4.5 Option Comparison Summary
+
+| | Option A | Option B | Option C | Option D |
+|---|---|---|---|---|
+| **Change** | Bodge wire | Add EINT trace | Full re-route | Full re-route + PIO SPI |
+| **EINT routed** | ✅ (wire) | ✅ (trace) | ✅ (trace) | ✅ (trace) |
+| **Contiguous rows** | ✗ | ✗ | ✅ | ✅ |
+| **Hardware SPI** | ✅ SPI0 | ✅ SPI0 | ✅ SPI1 | ✗ PIO |
+| **Spare pins** | GP46-47 | GP46-47 | GP42-43 | GP46-47 |
+| **Arena controller change** | None | None | SPI rewire | SPI rewire |
+| **PCB effort** | None | Minimal | Full re-route | Full re-route |
+| **Risk** | None | Very low | Medium | High |
+
+**Recommendation**: **Option B for the next PCB revision** (minimal change, maximum practical benefit). Option C only if a major board revision is already planned for other reasons.
 
 ---
 
@@ -274,7 +352,7 @@ Our firmware uses **binary-coded modulation** (4 bit-plane passes for 16 gray le
 
 ---
 
-## 6. Production Architecture with Redesigned PCB (Option B)
+## 6. Production Architecture with Redesigned PCB (Option C)
 
 ### 6.1 System Block Diagram
 
@@ -453,25 +531,36 @@ These are documented to prevent future re-exploration of paths we've already rul
 
 ### For Current Boards (Immediate)
 
-**Option A**: Bodge wire EINT to GP45. This enables external trigger testing with zero risk to existing functionality. All firmware development can continue.
+**Option A**: Bodge wire EINT to GP45. Gets external trigger working immediately with zero risk.
 
-### For Next PCB Revision
+### For Next PCB Revision (Recommended)
 
-**Option B**: Move SPI to SPI1 (GP44-47), make rows contiguous (GP21-40), route EINT to GP41.
+**Option B**: Add EINT trace to GP45 and break out GP45-47 to headers. No rerouting of existing signals.
 
-This is the clear winner:
-- **Strictly better than current design** in every dimension
-- **Hardware SPI preserved** — no PIO SM consumed, proven 25-30 MHz operation
-- **Both pin ranges contiguous** — enables future fully-autonomous PIO scanning
-- **EINT properly routed** — visible to PIO1 for hardware-timed trigger
-- **Firmware change is trivial** — `spi0` → `spi1`, update pin constants
-- **2 spare pins** (GP42-43) — room for sync output, debug, or second trigger
+This is the pragmatic choice:
+- **Zero risk to existing routing** — all current signals stay exactly where they are
+- **EINT properly routed** — no bodge wire, clean PCB trace
+- **Spare pins accessible** — GP46 for sync output, GP47 for frame sync / debug
+- **No firmware SPI changes** — arena controller is completely unaffected
+- **No arena controller hardware changes** — same connectors, same wiring
+- **Proven architecture** — our zero-jitter BCM works on this exact pin layout today
 
-Option C (PIO-based SPI) adds complexity and consumes a PIO state machine for no practical benefit over Option B.
+### For Future Major Revision (If Needed)
+
+**Option C**: Move SPI to SPI1 (GP44-47), make rows contiguous (GP21-40).
+
+Only worth doing if:
+- A major board revision is already planned for other reasons
+- Fully autonomous PIO scanning (zero CPU in scan path) becomes a requirement
+- The GP32-35 gap workaround in firmware becomes a maintenance burden
+
+Option D (PIO-based SPI) is not recommended — it adds complexity for no practical benefit over Option C.
 
 ---
 
-## 10. Pin Assignment Summary (Option B)
+## 10. Pin Assignment Summaries
+
+### Option B (Recommended — Minimal Change)
 
 ```
 ┌────────┬────────────────────────────────────┬───────────────────┐
@@ -479,16 +568,33 @@ Option C (PIO-based SPI) adds complexity and consumes a PIO state machine for no
 ├────────┼────────────────────────────────────┼───────────────────┤
 │  GP0   │  XIP_CS1n (PSRAM)                  │  Fixed (hardware) │
 │  GP1   │  COL_MCU_00                        │  PIO0 out pins    │
-│  GP2   │  COL_MCU_01                        │       │           │
+│  ...   │  ...                               │       │           │
+│  GP20  │  COL_MCU_19                        │       ▼           │
+│  GP21  │  ROW_MCU_00                        │  CPU gpio_mask64  │
+│  ...   │  ... (GP32-35 = SPI0 gap)          │       │           │
+│  GP44  │  ROW_MCU_19                        │       ▼           │
+│  GP45  │  EINT (external trigger)           │  PIO1 wait / GPIO │
+│  GP46  │  Sync output (burst active)        │  GPIO             │
+│  GP47  │  Frame-sync output / debug         │  GPIO             │
+└────────┴────────────────────────────────────┴───────────────────┘
+```
+
+### Option C (Optimal — Full Re-route)
+
+```
+┌────────┬────────────────────────────────────┬───────────────────┐
+│  GPIO  │  Function                          │  Interface        │
+├────────┼────────────────────────────────────┼───────────────────┤
+│  GP0   │  XIP_CS1n (PSRAM)                  │  Fixed (hardware) │
+│  GP1   │  COL_MCU_00                        │  PIO0 out pins    │
 │  ...   │  ...                               │       │           │
 │  GP20  │  COL_MCU_19                        │       ▼           │
 │  GP21  │  ROW_MCU_00                        │  PIO1 out pins    │
-│  GP22  │  ROW_MCU_01                        │  (or CPU mask)    │
-│  ...   │  ...                               │       │           │
+│  ...   │  ... (no gap!)                     │  (or CPU mask)    │
 │  GP40  │  ROW_MCU_19                        │       ▼           │
 │  GP41  │  EINT (external trigger)           │  PIO1 wait / GPIO │
-│  GP42  │  Spare (sync output?)              │  GPIO             │
-│  GP43  │  Spare (debug?)                    │  GPIO             │
+│  GP42  │  Sync output (burst active)        │  GPIO             │
+│  GP43  │  Frame-sync output / debug         │  GPIO             │
 │  GP44  │  SPI1_RX (MISO)                    │  Hardware SPI1    │
 │  GP45  │  SPI1_CSn (CS)                     │       │           │
 │  GP46  │  SPI1_SCK (SCK)                    │       │           │
