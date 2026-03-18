@@ -2448,6 +2448,236 @@ static void cmd_bcmdemo() {
 }
 
 // ---------------------------------------------------------------------------
+// BCMVISUAL: visual + jitter test with SRAM frame refresh at 400 Hz
+// Shows N intensity levels for hold_sec each. Reloads frame from SRAM every
+// frame (memcpy + per-row precompute) to simulate production SPI data path.
+// ---------------------------------------------------------------------------
+
+static void __attribute__((noinline)) __not_in_flash_func(run_bcm_visual_level)(
+    uint8_t intensity, uint32_t n_triggers, float trigger_rate_hz,
+    uint8_t* src_frame, uint32_t* out_frame_swaps, uint32_t* out_pc_cyc_total, uint32_t* out_pc_count)
+{
+    // Fill source frame with uniform intensity
+    memset(src_frame, intensity, PANEL_SIZE * PANEL_SIZE);
+
+    // Initial full precompute
+    memcpy(pixel_data, src_frame, sizeof(pixel_data));
+    precompute_bcm_data();
+
+    stats_reset();
+
+    // Compute outlier threshold
+    uint32_t base_cycles = (uint32_t)(bcm_base_on_us * cycles_per_us);
+    uint32_t nominal_burst_cyc = 0;
+    for (int b = 0; b < bcm_bits; b++) {
+        nominal_burst_cyc += base_cycles * (1U << b) + PIO_ON_OVERHEAD_CYCLES + 50;
+    }
+    stat_outlier_threshold = nominal_burst_cyc * 2;
+
+    uint32_t trigger_period_cyc = (uint32_t)(cycles_per_us * 1000000.0f / trigger_rate_hz);
+    uint32_t frame_swaps = 0;
+    uint32_t pc_cyc_total = 0;
+    uint32_t pc_count = 0;
+
+    // Warm-up: 100 triggers with noInterrupts (stabilize pipeline)
+    {
+        uint8_t wr = 0;
+        uint32_t wu_start = m33_hw->dwt_cyccnt;
+        noInterrupts();
+        for (uint32_t w = 0; w < 100; w++) {
+            while ((m33_hw->dwt_cyccnt - wu_start) < trigger_period_cyc) {}
+            wu_start += trigger_period_cyc;
+            gpio_set_mask64(row_on_mask[wr]);
+            for (int b = 0; b < bcm_bits; b++) {
+                pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, bcm_plane_data[wr][b][0]);
+                pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, bcm_plane_data[wr][b][1]);
+                while (!pio_interrupt_get(pio_hw_inst, 0)) {}
+                pio_interrupt_clear(pio_hw_inst, 0);
+            }
+            gpio_clr_mask64(row_on_mask[wr]);
+            wr++;
+            if (wr >= active_rows) wr = 0;
+        }
+        interrupts();
+    }
+    stats_reset();
+
+    // Disable SysTick
+    systick_hw->csr &= ~1u;
+
+    // Main triggered loop
+    uint32_t trigger_start = m33_hw->dwt_cyccnt;
+    uint8_t row = 0;
+
+    for (uint32_t t = 0; t < n_triggers; t++) {
+        // --- IDLE PHASE ---
+        // At frame boundary (row == 0): reload pixel_data from SRAM source
+        if (row == 0 && t > 0) {
+            memcpy(pixel_data, src_frame, sizeof(pixel_data));
+            frame_swaps++;
+        }
+
+        // Precompute NEXT row's BCM data (incremental, ~38µs spread across idles)
+        uint8_t next_row = (row + 1 >= active_rows) ? 0 : row + 1;
+        uint32_t pc_start = m33_hw->dwt_cyccnt;
+        precompute_bcm_row(next_row);
+        uint32_t pc_end = m33_hw->dwt_cyccnt;
+        pc_cyc_total += (pc_end - pc_start);
+        pc_count++;
+
+        // Wait for trigger, then disable interrupts for burst
+        while ((m33_hw->dwt_cyccnt - trigger_start) < trigger_period_cyc) {}
+        trigger_start += trigger_period_cyc;
+        noInterrupts();
+
+        // --- BURST PHASE: one row, all bit-planes ---
+        uint32_t burst_start = m33_hw->dwt_cyccnt;
+
+        gpio_set_mask64(row_on_mask[row]);
+        for (int b = 0; b < bcm_bits; b++) {
+            pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, bcm_plane_data[row][b][0]);
+            pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, bcm_plane_data[row][b][1]);
+            while (!pio_interrupt_get(pio_hw_inst, 0)) {}
+            pio_interrupt_clear(pio_hw_inst, 0);
+        }
+        gpio_clr_mask64(row_on_mask[row]);
+
+        uint32_t burst_end = m33_hw->dwt_cyccnt;
+        interrupts();
+
+        stats_update(burst_end - burst_start, 0);
+
+        row++;
+        if (row >= active_rows) row = 0;
+    }
+
+    // Re-enable SysTick
+    systick_hw->csr |= 1u;
+
+    *out_frame_swaps = frame_swaps;
+    *out_pc_cyc_total = pc_cyc_total;
+    *out_pc_count = pc_count;
+}
+
+static void cmd_bcmvisual(const char* arg) {
+    // Parse: BCMVISUAL [hold_sec]
+    float hold_sec = 5.0f;
+
+    if (arg && *arg) {
+        hold_sec = strtof(arg, nullptr);
+        if (hold_sec < 0.5f || hold_sec > 30.0f) {
+            Serial.println("ERR: BCMVISUAL [hold_sec 0.5-30]");
+            return;
+        }
+    }
+
+    if (!pio_loaded && !pio_init_program()) return;
+
+    bool was_running = running;
+    running = false;
+    all_off();
+    col_pins_to_pio();
+    precompute_scan_masks();
+
+    float rate = 8000.0f;
+    uint32_t triggers_per_level = (uint32_t)(hold_sec * rate);
+    int max_val = (1 << bcm_bits) - 1;
+
+    // 4 test levels
+    const uint8_t levels[] = {0, 5, 10, (uint8_t)max_val};
+    const int n_levels = 4;
+
+    // Allocate source frame in heap (simulate SPI receive buffer)
+    uint8_t* src_frame = (uint8_t*)malloc(PANEL_SIZE * PANEL_SIZE);
+    if (!src_frame) {
+        Serial.println("ERR: malloc failed");
+        return;
+    }
+
+    // Drain serial buffer
+    delay(50);
+    while (Serial.available()) Serial.read();
+
+    // Reset PIO SM (restart clears pindirs on RP2350, so re-set them)
+    pio_sm_set_enabled(pio_hw_inst, pio_sm_idx, false);
+    pio_sm_clear_fifos(pio_hw_inst, pio_sm_idx);
+    pio_sm_restart(pio_hw_inst, pio_sm_idx);
+    pio_sm_set_consecutive_pindirs(pio_hw_inst, pio_sm_idx, COL_PIN[0], PANEL_SIZE, true);
+    pio_sm_exec(pio_hw_inst, pio_sm_idx, pio_encode_jmp(pio_offset));
+    pio_interrupt_clear(pio_hw_inst, 0);
+    pio_sm_set_enabled(pio_hw_inst, pio_sm_idx, true);
+    pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, 0xFFFFF);
+
+    Serial.println("--- BCMVISUAL START ---");
+    Serial.print("BCM bits=");
+    Serial.print(bcm_bits);
+    Serial.print("  Base T=");
+    Serial.print(bcm_base_on_us, 3);
+    Serial.print("us  Hold=");
+    Serial.print(hold_sec, 1);
+    Serial.print("s  Rate=");
+    Serial.print(rate, 0);
+    Serial.print("Hz  Triggers/level=");
+    Serial.println(triggers_per_level);
+    Serial.println("level,burst_min_us,burst_max_us,burst_mean_us,jitter_us,outliers,triggers,frame_swaps,precompute_avg_us");
+
+    // Lock out Core 1 for all levels
+    multicore_lockout_start_blocking();
+
+    for (int i = 0; i < n_levels; i++) {
+        uint8_t intensity = levels[i];
+
+        uint32_t frame_swaps = 0, pc_cyc_total = 0, pc_count = 0;
+        run_bcm_visual_level(intensity, triggers_per_level, rate,
+                             src_frame, &frame_swaps, &pc_cyc_total, &pc_count);
+
+        // Print CSV row
+        float burst_min = cycles_to_us(stat_on_min);
+        float burst_max = cycles_to_us(stat_on_max);
+        float burst_mean = (stat_count > 0) ? cycles_to_us((uint32_t)(stat_on_sum / stat_count)) : 0;
+        float jitter = burst_max - burst_min;
+        float pc_avg = (pc_count > 0) ? cycles_to_us(pc_cyc_total / pc_count) : 0;
+
+        Serial.print(intensity);
+        Serial.print(",");
+        Serial.print(burst_min, 3);
+        Serial.print(",");
+        Serial.print(burst_max, 3);
+        Serial.print(",");
+        Serial.print(burst_mean, 3);
+        Serial.print(",");
+        Serial.print(jitter, 3);
+        Serial.print(",");
+        Serial.print(stat_outlier_count);
+        Serial.print(",");
+        Serial.print(stat_count);
+        Serial.print(",");
+        Serial.print(frame_swaps);
+        Serial.print(",");
+        Serial.println(pc_avg, 3);
+
+        if (user_wants_stop()) {
+            Serial.println("  (stopped by user)");
+            break;
+        }
+    }
+
+    multicore_lockout_end_blocking();
+
+    pio_sm_set_enabled(pio_hw_inst, pio_sm_idx, false);
+    all_off();
+    free(src_frame);
+
+    Serial.println("--- BCMVISUAL END ---");
+
+    col_pins_to_sio();
+    precompute_scan_masks();
+    stats_reset();
+    running = was_running;
+    if (running) count = 0;
+}
+
+// ---------------------------------------------------------------------------
 // RAMBURST: production simulation with frame cycling from RAM
 // Tests double-buffering + precompute at 400 Hz frame rate.
 // Pre-stores test patterns in RAM, cycles through them at frame boundaries.
@@ -3093,6 +3323,7 @@ static void cmd_help() {
     Serial.println("BCMBURST <N> [Hz] [A|B|C]  BCM burst scan");
     Serial.println("                 A=PIO, B=DMA, C=MSM (default A, 8000 Hz)");
     Serial.println("BCMDEMO          Ramp 0→max intensity, 1s/step, timing data");
+    Serial.println("BCMVISUAL [sec]  Visual test: 4 levels x sec (SRAM reload @ 400Hz)");
     Serial.println("REBOOT           Reboot into BOOTSEL (USB flash) mode");
     Serial.println("HELP             This message");
 }
@@ -3724,6 +3955,8 @@ static void process_command() {
         cmd_bcmburst(args);
     } else if (strcmp(cmd_buf, "BCMDEMO") == 0) {
         cmd_bcmdemo();
+    } else if (strcmp(cmd_buf, "BCMVISUAL") == 0) {
+        cmd_bcmvisual(args);
     } else if (strcmp(cmd_buf, "RAMBURST") == 0) {
         cmd_ramburst(args);
     } else if (strcmp(cmd_buf, "REBOOT") == 0) {
