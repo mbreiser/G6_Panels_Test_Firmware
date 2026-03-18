@@ -16,6 +16,7 @@
 #include <hardware/pio.h>
 #include <hardware/dma.h>
 #include <hardware/irq.h>
+#include <pico/multicore.h>
 #include "constants.h"
 #include "utilities.h"
 
@@ -54,6 +55,17 @@ static void __not_in_flash_func(dwt_delay_cycles)(uint32_t cycles) {
 
 static inline float cycles_to_us(uint32_t cycles) {
     return (float)cycles / (float)cycles_per_us;
+}
+
+// Check if user wants to stop — only triggers on newline, drains other data
+static inline bool user_wants_stop() {
+    if (!Serial.available()) return false;
+    bool stop = false;
+    while (Serial.available()) {
+        char ch = Serial.read();
+        if (ch == '\n' || ch == '\r') stop = true;
+    }
+    return stop;
 }
 
 // ---------------------------------------------------------------------------
@@ -227,28 +239,42 @@ static void precompute_scan_masks() {
 #define PIO_ON_OVERHEAD_CYCLES 5
 
 // Pre-compute BCM bit-plane data from pixel_data[][]
-// For each row and bit-plane: extract column pattern, compute PIO delay
+// For each schematic row and bit-plane: compute PIO column pattern and delay.
+// Must index by SCHEMATIC row (not layout row) because row_on_mask[r] activates
+// schematic row r. Each layout position (lr,lc) belongs to schematic row
+// layout_to_sch_row[lr][lc] and schematic column layout_to_sch_col[lr][lc].
 static void precompute_bcm_data() {
     uint32_t base_cycles = (uint32_t)(bcm_base_on_us * cycles_per_us);
+
+    // Precompute delays (same for all rows; vary per bit-plane only)
+    uint32_t pio_delays[8];
+    for (int b = 0; b < bcm_bits; b++) {
+        uint32_t on_cycles_b = base_cycles * (1U << b);
+        pio_delays[b] = (on_cycles_b > PIO_ON_OVERHEAD_CYCLES)
+                      ? (on_cycles_b - PIO_ON_OVERHEAD_CYCLES) : 0;
+    }
+
+    // Start with all columns OFF (HIGH = 0xFFFFF in PIO inverted encoding)
     for (int r = 0; r < PANEL_SIZE; r++) {
         for (int b = 0; b < bcm_bits; b++) {
-            // Extract bit-plane b: which schematic columns should be ON
-            uint32_t pattern = 0;
-            for (int c = 0; c < PANEL_SIZE; c++) {
-                // Map layout col → schematic col for correct physical pin
-                uint8_t sch_col = layout_to_sch_col[r][c];
-                if (pixel_data[r][c] & (1 << b)) {
-                    pattern |= (1UL << sch_col);
+            bcm_plane_data[r][b][0] = 0xFFFFF;  // all columns HIGH = all OFF
+            bcm_plane_data[r][b][1] = pio_delays[b];
+        }
+    }
+
+    // For each layout pixel, OR its bit-plane contribution into the correct
+    // schematic row's column pattern
+    for (int lr = 0; lr < PANEL_SIZE; lr++) {
+        for (int lc = 0; lc < PANEL_SIZE; lc++) {
+            uint8_t sch_row = layout_to_sch_row[lr][lc];
+            uint8_t sch_col = layout_to_sch_col[lr][lc];
+            uint8_t intensity = pixel_data[lr][lc];
+            for (int b = 0; b < bcm_bits; b++) {
+                if (intensity & (1 << b)) {
+                    // Clear this column's bit → drive LOW → LED ON
+                    bcm_plane_data[sch_row][b][0] &= ~(1UL << sch_col);
                 }
             }
-            // Invert for PIO (LOW = ON for reversed polarity LEDs)
-            uint32_t pio_col_word = (~pattern) & 0xFFFFF;
-            // Delay = T * 2^b, adjusted for PIO overhead
-            uint32_t on_cycles_b = base_cycles * (1U << b);
-            uint32_t pio_delay = (on_cycles_b > PIO_ON_OVERHEAD_CYCLES)
-                               ? (on_cycles_b - PIO_ON_OVERHEAD_CYCLES) : 0;
-            bcm_plane_data[r][b][0] = pio_col_word;
-            bcm_plane_data[r][b][1] = pio_delay;
         }
     }
 }
@@ -335,6 +361,9 @@ static bool pio_init_program() {
     sm_config_set_out_shift(&c, true, false, 32);          // shift right, manual pull
 
     pio_sm_init(pio_hw_inst, pio_sm_idx, pio_offset, &c);
+
+    // Set column pins as outputs for the PIO SM
+    pio_sm_set_consecutive_pindirs(pio_hw_inst, pio_sm_idx, COL_PIN[0], PANEL_SIZE, true);
 
     pio_loaded = true;
     Serial.print("PIO OK: pio");
@@ -672,7 +701,7 @@ static void __not_in_flash_func(run_hybrid_scan_frames)(uint32_t n_frames) {
         uint32_t row_avg_cyc = frame_cyc / active_rows;
         stats_update(frame_cyc, row_avg_cyc);
 
-        if ((f % 100 == 99) && Serial.available()) {
+        if ((f % 100 == 99) && user_wants_stop()) {
             Serial.print("  (interrupted at frame ");
             Serial.print(f + 1);
             Serial.println(")");
@@ -1193,7 +1222,7 @@ static void __not_in_flash_func(msm_run_scan_frames)(uint32_t n_frames) {
         uint32_t row_avg_cyc = frame_cyc / active_rows;
         stats_update(frame_cyc, row_avg_cyc);
 
-        if ((f % 100 == 99) && Serial.available()) {
+        if ((f % 100 == 99) && user_wants_stop()) {
             Serial.print("  (interrupted at frame ");
             Serial.print(f + 1);
             Serial.println(")");
@@ -1603,10 +1632,11 @@ static void __not_in_flash_func(run_burst_scan)(
 
     uint32_t trigger_period_cyc = (uint32_t)(cycles_per_us * 1000000.0f / trigger_rate_hz);
 
-    // Reset and enable PIO SM
+    // Reset and enable PIO SM (restart clears pindirs on RP2350, so re-set them)
     pio_sm_set_enabled(pio_hw_inst, pio_sm_idx, false);
     pio_sm_clear_fifos(pio_hw_inst, pio_sm_idx);
     pio_sm_restart(pio_hw_inst, pio_sm_idx);
+    pio_sm_set_consecutive_pindirs(pio_hw_inst, pio_sm_idx, COL_PIN[0], PANEL_SIZE, true);
     pio_sm_exec(pio_hw_inst, pio_sm_idx, pio_encode_jmp(pio_offset));
     pio_interrupt_clear(pio_hw_inst, 0);
     pio_sm_set_enabled(pio_hw_inst, pio_sm_idx, true);
@@ -1659,7 +1689,7 @@ static void __not_in_flash_func(run_burst_scan)(
         stats_update(frame_cyc, row_avg_cyc);
 
         // Allow early stop every 1000 triggers
-        if ((t % 1000 == 999) && Serial.available()) {
+        if ((t % 1000 == 999) && user_wants_stop()) {
             Serial.print("  (interrupted at trigger ");
             Serial.print(t + 1);
             Serial.println(")");
@@ -1787,10 +1817,11 @@ static void __not_in_flash_func(run_bcm_burst_pio)(
     }
     stat_outlier_threshold = nominal_burst_cyc * 2;
 
-    // Reset and enable PIO SM
+    // Reset and enable PIO SM (restart clears pindirs on RP2350, so re-set them)
     pio_sm_set_enabled(pio_hw_inst, pio_sm_idx, false);
     pio_sm_clear_fifos(pio_hw_inst, pio_sm_idx);
     pio_sm_restart(pio_hw_inst, pio_sm_idx);
+    pio_sm_set_consecutive_pindirs(pio_hw_inst, pio_sm_idx, COL_PIN[0], PANEL_SIZE, true);
     pio_sm_exec(pio_hw_inst, pio_sm_idx, pio_encode_jmp(pio_offset));
     pio_interrupt_clear(pio_hw_inst, 0);
     pio_sm_set_enabled(pio_hw_inst, pio_sm_idx, true);
@@ -1810,6 +1841,37 @@ static void __not_in_flash_func(run_bcm_burst_pio)(
     gpio_clr_mask64(row_on_mask[0]);
     interrupts();
 
+    // Lock out Core 1 + disable all Core 0 interrupts for ENTIRE measurement.
+    // This eliminates ALL sources of timing variation:
+    //   - Core 1 bus contention (multicore lockout)
+    //   - Core 0 interrupt servicing between bursts (noInterrupts for entire loop)
+    // USB will be unresponsive for ~1.25s at 10k/8kHz. Acceptable for measurement.
+    multicore_lockout_start_blocking();
+    noInterrupts();
+
+    // Warm-up: run 100 full trigger cycles (all 20 rows × 5 frames) to
+    // stabilize pipeline, branch predictor, and bus arbitration state.
+    // This eliminates cold-start jitter artifacts.
+    {
+        uint8_t wr = 0;
+        uint32_t wu_start = m33_hw->dwt_cyccnt;
+        for (uint32_t w = 0; w < 100; w++) {
+            while ((m33_hw->dwt_cyccnt - wu_start) < trigger_period_cyc) {}
+            wu_start += trigger_period_cyc;
+            gpio_set_mask64(row_on_mask[wr]);
+            for (int b = 0; b < bcm_bits; b++) {
+                pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, bcm_plane_data[wr][b][0]);
+                pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, bcm_plane_data[wr][b][1]);
+                while (!pio_interrupt_get(pio_hw_inst, 0)) {}
+                pio_interrupt_clear(pio_hw_inst, 0);
+            }
+            gpio_clr_mask64(row_on_mask[wr]);
+            wr++;
+            if (wr >= active_rows) wr = 0;
+        }
+    }
+    stats_reset();  // clear any stats from warm-up
+
     // Main trigger loop
     uint32_t trigger_start = m33_hw->dwt_cyccnt;
     uint8_t row = 0;
@@ -1820,7 +1882,6 @@ static void __not_in_flash_func(run_bcm_burst_pio)(
         trigger_start += trigger_period_cyc;
 
         // --- Scan burst: one row, all bit-planes ---
-        noInterrupts();
         uint32_t burst_start = m33_hw->dwt_cyccnt;
 
         gpio_set_mask64(row_on_mask[row]);
@@ -1833,20 +1894,15 @@ static void __not_in_flash_func(run_bcm_burst_pio)(
         gpio_clr_mask64(row_on_mask[row]);
 
         uint32_t burst_end = m33_hw->dwt_cyccnt;
-        interrupts();
 
         stats_update(burst_end - burst_start, 0);
 
         row++;
         if (row >= active_rows) row = 0;
-
-        if ((t % 1000 == 999) && Serial.available()) {
-            Serial.print("  (interrupted at trigger ");
-            Serial.print(t + 1);
-            Serial.println(")");
-            break;
-        }
     }
+
+    interrupts();
+    multicore_lockout_end_blocking();
 
     pio_sm_set_enabled(pio_hw_inst, pio_sm_idx, false);
     all_off();
@@ -1945,7 +2001,7 @@ static void __not_in_flash_func(run_bcm_burst_dma)(
         row++;
         if (row >= active_rows) row = 0;
 
-        if ((t % 1000 == 999) && Serial.available()) {
+        if ((t % 1000 == 999) && user_wants_stop()) {
             Serial.print("  (interrupted at trigger ");
             Serial.print(t + 1);
             Serial.println(")");
@@ -2057,7 +2113,7 @@ static void __not_in_flash_func(run_bcm_burst_msm)(
         row++;
         if (row >= active_rows) row = 0;
 
-        if ((t % 1000 == 999) && Serial.available()) {
+        if ((t % 1000 == 999) && user_wants_stop()) {
             Serial.print("  (interrupted at trigger ");
             Serial.print(t + 1);
             Serial.println(")");
@@ -2114,6 +2170,10 @@ static void cmd_bcmburst(const char* arg) {
         est_burst_us += bcm_base_on_us * (1 << b) + 0.40f; // ~0.40 µs overhead per pass
     }
     float period_us = 1000000.0f / rate;
+
+    // Drain any buffered serial data (from host setup commands)
+    delay(50);
+    while (Serial.available()) Serial.read();
 
     Serial.println("--- BCMBURST START ---");
     Serial.print("BCM bits=");
@@ -2213,6 +2273,143 @@ static void cmd_gradient() {
     Serial.print("GRADIENT set (row-varying, 0-");
     Serial.print(max_val);
     Serial.println(")");
+}
+
+// BCM visual demo: ramp intensity from 0 to max, hold each level for ~1 second
+// Runs Mode A (PIO burst) at 8 kHz, stepping intensity every second.
+// Reports timing stats for each intensity level.
+static void cmd_bcmdemo() {
+    if (!pio_loaded && !pio_init_program()) return;
+
+    bool was_running = running;
+    running = false;
+    all_off();
+    col_pins_to_pio();
+
+    int max_val = (1 << bcm_bits) - 1;
+    float rate = 8000.0f;
+    uint32_t triggers_per_step = (uint32_t)rate;  // 1 second per step
+    uint32_t trigger_period_cyc = (uint32_t)(cycles_per_us * 1000000.0f / rate);
+
+    // Compute outlier threshold
+    uint32_t base_cycles = (uint32_t)(bcm_base_on_us * cycles_per_us);
+    uint32_t nominal_burst_cyc = 0;
+    for (int b = 0; b < bcm_bits; b++) {
+        nominal_burst_cyc += base_cycles * (1U << b) + PIO_ON_OVERHEAD_CYCLES + 50;
+    }
+
+    Serial.println("--- BCMDEMO START ---");
+    Serial.print("BCM bits=");
+    Serial.print(bcm_bits);
+    Serial.print("  Base T=");
+    Serial.print(bcm_base_on_us, 3);
+    Serial.print("us  Levels=0-");
+    Serial.print(max_val);
+    Serial.print("  Hold=1s each  Rate=");
+    Serial.print(rate, 0);
+    Serial.println("Hz");
+    Serial.println("intensity,mean_us,jitter_us,outliers,count");
+
+    // Drain any buffered serial data (prevents early stop from host setup cmds)
+    while (Serial.available()) Serial.read();
+
+    // Reset PIO SM without clearing pindirs (pio_sm_restart clears them on RP2350)
+    pio_sm_set_enabled(pio_hw_inst, pio_sm_idx, false);
+    pio_sm_clear_fifos(pio_hw_inst, pio_sm_idx);
+    pio_sm_exec(pio_hw_inst, pio_sm_idx, pio_encode_jmp(pio_offset));
+    pio_interrupt_clear(pio_hw_inst, 0);
+    pio_sm_set_enabled(pio_hw_inst, pio_sm_idx, true);
+    pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, 0xFFFFF);
+
+    // Warm-up frame
+    for (int r = 0; r < PANEL_SIZE; r++)
+        for (int c = 0; c < PANEL_SIZE; c++)
+            pixel_data[r][c] = 0;
+    precompute_bcm_data();
+    noInterrupts();
+    gpio_set_mask64(row_on_mask[0]);
+    for (int b = 0; b < bcm_bits; b++) {
+        pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, bcm_plane_data[0][b][0]);
+        pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, bcm_plane_data[0][b][1]);
+        while (!pio_interrupt_get(pio_hw_inst, 0)) {}
+        pio_interrupt_clear(pio_hw_inst, 0);
+    }
+    gpio_clr_mask64(row_on_mask[0]);
+    interrupts();
+
+    // Ramp through each intensity level
+    // Free-running: scan ALL rows continuously for max brightness (visual test)
+    uint32_t hold_us = 1000000;  // 1 second per intensity level
+    uint32_t hold_cyc = (uint32_t)(hold_us * cycles_per_us);
+
+    for (int intensity = 0; intensity <= max_val; intensity++) {
+        // Set all pixels to this intensity
+        for (int r = 0; r < PANEL_SIZE; r++)
+            for (int c = 0; c < PANEL_SIZE; c++)
+                pixel_data[r][c] = (uint8_t)intensity;
+        precompute_bcm_data();
+
+        stats_reset();
+        stat_outlier_threshold = nominal_burst_cyc * 2;
+
+        uint32_t level_start = m33_hw->dwt_cyccnt;
+        uint8_t row = 0;
+        uint32_t frames = 0;
+
+        // Scan all rows continuously for 1 second
+        while ((m33_hw->dwt_cyccnt - level_start) < hold_cyc) {
+            // Scan one full frame (all rows)
+            noInterrupts();
+            for (uint8_t r = 0; r < active_rows; r++) {
+                uint32_t burst_start = m33_hw->dwt_cyccnt;
+
+                gpio_set_mask64(row_on_mask[r]);
+                for (int b = 0; b < bcm_bits; b++) {
+                    pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, bcm_plane_data[r][b][0]);
+                    pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, bcm_plane_data[r][b][1]);
+                    while (!pio_interrupt_get(pio_hw_inst, 0)) {}
+                    pio_interrupt_clear(pio_hw_inst, 0);
+                }
+                gpio_clr_mask64(row_on_mask[r]);
+
+                uint32_t burst_end = m33_hw->dwt_cyccnt;
+                stats_update(burst_end - burst_start, 0);
+            }
+            interrupts();
+            frames++;
+        }
+
+        // Print CSV row for this intensity level
+        float mean_us = cycles_to_us((uint32_t)(stat_on_sum / stat_count));
+        float jitter = cycles_to_us(stat_on_max) - cycles_to_us(stat_on_min);
+        Serial.print(intensity);
+        Serial.print(",");
+        Serial.print(mean_us, 3);
+        Serial.print(",");
+        Serial.print(jitter, 3);
+        Serial.print(",");
+        Serial.print(stat_outlier_count);
+        Serial.print(",");
+        Serial.print(stat_count);
+        Serial.print(",frames=");
+        Serial.println(frames);
+
+        if (user_wants_stop()) {
+            Serial.println("  (stopped by user)");
+            break;
+        }
+    }
+
+    pio_sm_set_enabled(pio_hw_inst, pio_sm_idx, false);
+    all_off();
+
+    Serial.println("--- BCMDEMO END ---");
+
+    col_pins_to_sio();
+    precompute_scan_masks();
+    stats_reset();
+    running = was_running;
+    if (running) count = 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -2402,7 +2599,7 @@ static void __not_in_flash_func(run_scan_frames)(uint32_t n_frames) {
         stats_update(frame_cyc, row_avg_cyc);
 
         // Check for serial input every 100 frames — allows early stop
-        if ((f % 100 == 99) && Serial.available()) {
+        if ((f % 100 == 99) && user_wants_stop()) {
             Serial.print("  (interrupted at frame ");
             Serial.print(f + 1);
             Serial.println(")");
@@ -2431,10 +2628,11 @@ static void __not_in_flash_func(run_pio_rowtime)(uint32_t n_iters) {
     // Pre-invert column pattern for PIO (1=HIGH=OFF, 0=LOW=ON)
     uint32_t pio_col_word = (~col_pattern) & 0xFFFFF;
 
-    // Reset and enable PIO SM
+    // Reset and enable PIO SM (restart clears pindirs on RP2350, so re-set them)
     pio_sm_set_enabled(pio_hw_inst, pio_sm_idx, false);
     pio_sm_clear_fifos(pio_hw_inst, pio_sm_idx);
     pio_sm_restart(pio_hw_inst, pio_sm_idx);
+    pio_sm_set_consecutive_pindirs(pio_hw_inst, pio_sm_idx, COL_PIN[0], PANEL_SIZE, true);
     pio_sm_exec(pio_hw_inst, pio_sm_idx, pio_encode_jmp(pio_offset));
     pio_interrupt_clear(pio_hw_inst, 0);
     pio_sm_set_enabled(pio_hw_inst, pio_sm_idx, true);
@@ -2486,10 +2684,11 @@ static void __not_in_flash_func(run_pio_scan_frames)(uint32_t n_frames, int mode
     uint32_t pio_delay = (on_cycles > PIO_ON_OVERHEAD_CYCLES)
                        ? (on_cycles - PIO_ON_OVERHEAD_CYCLES) : 0;
 
-    // Reset and enable PIO SM
+    // Reset and enable PIO SM (restart clears pindirs on RP2350, so re-set them)
     pio_sm_set_enabled(pio_hw_inst, pio_sm_idx, false);
     pio_sm_clear_fifos(pio_hw_inst, pio_sm_idx);
     pio_sm_restart(pio_hw_inst, pio_sm_idx);
+    pio_sm_set_consecutive_pindirs(pio_hw_inst, pio_sm_idx, COL_PIN[0], PANEL_SIZE, true);
     pio_sm_exec(pio_hw_inst, pio_sm_idx, pio_encode_jmp(pio_offset));
     pio_interrupt_clear(pio_hw_inst, 0);
     pio_sm_set_enabled(pio_hw_inst, pio_sm_idx, true);
@@ -2528,7 +2727,7 @@ static void __not_in_flash_func(run_pio_scan_frames)(uint32_t n_frames, int mode
         stats_update(frame_cyc, row_avg_cyc);
 
         // Check for serial input every 100 frames — allows early stop
-        if ((f % 100 == 99) && Serial.available()) {
+        if ((f % 100 == 99) && user_wants_stop()) {
             Serial.print("  (interrupted at frame ");
             Serial.print(f + 1);
             Serial.println(")");
@@ -2580,6 +2779,7 @@ static void cmd_help() {
     Serial.println("GRADIENT         Row-varying intensity gradient");
     Serial.println("BCMBURST <N> [Hz] [A|B|C]  BCM burst scan");
     Serial.println("                 A=PIO, B=DMA, C=MSM (default A, 8000 Hz)");
+    Serial.println("BCMDEMO          Ramp 0→max intensity, 1s/step, timing data");
     Serial.println("REBOOT           Reboot into BOOTSEL (USB flash) mode");
     Serial.println("HELP             This message");
 }
@@ -3128,6 +3328,11 @@ static void process_command() {
     }
     if (cmd_len == 0) return;
 
+    // Drain any trailing bytes from the command (e.g., \n after \r)
+    // This prevents scan loops from seeing stale serial data
+    delay(1);  // Let USB deliver any remaining bytes from the same packet
+    while (Serial.available()) Serial.read();
+
     char* space = strchr(cmd_buf, ' ');
     char* args = nullptr;
     if (space) {
@@ -3204,6 +3409,8 @@ static void process_command() {
         cmd_gradient();
     } else if (strcmp(cmd_buf, "BCMBURST") == 0) {
         cmd_bcmburst(args);
+    } else if (strcmp(cmd_buf, "BCMDEMO") == 0) {
+        cmd_bcmdemo();
     } else if (strcmp(cmd_buf, "REBOOT") == 0) {
         Serial.println("Rebooting into BOOTSEL mode...");
         Serial.flush();
@@ -3241,6 +3448,17 @@ static void poll_serial() {
 // ---------------------------------------------------------------------------
 // Arduino setup
 // ---------------------------------------------------------------------------
+// Core 1: install multicore lockout handler so Core 0 can pause Core 1
+// during timing-critical scan bursts (eliminates bus contention jitter)
+void setup1() {
+    multicore_lockout_victim_init();
+}
+
+void loop1() {
+    // Arduino-Pico USB stack runs on Core 1 automatically.
+    // loop1 is intentionally empty — the USB stack uses interrupts.
+}
+
 void setup() {
     Serial.begin(115200);
     delay(2000);

@@ -31,11 +31,17 @@ Characterize and optimize LED timing on G6 20×20 passive LED matrix panels driv
 
 ## Key Technical Details
 
-- **Zero jitter** requires: `__not_in_flash_func()` on all timing code (avoids XIP cache eviction from Core 1 USB stack) + `noInterrupts()` on Core 0
+- **Zero jitter recipe** (3 ingredients, ALL required):
+  1. `__not_in_flash_func()` on all timing code (avoids XIP cache eviction)
+  2. `noInterrupts()` on Core 0 for the entire scan loop (not just per-burst)
+  3. `multicore_lockout_start_blocking()` to pause Core 1 during scan (eliminates bus contention)
+  4. 100-trigger warm-up inside lockout before measurement (eliminates cold-start pipeline artifacts)
+  - **Without all 3**: jitter is 0.7-2.2 µs. **With all 3**: jitter = 0.000 µs across 640k measurements.
+- **Core 1 lockout setup**: `setup1()` must call `multicore_lockout_victim_init()` so Core 1 can be paused
 - **DWT cycle counter** for timing: `m33_hw->dwt_cyccnt` via `#include <hardware/structs/m33.h>`
 - **PIO** drives columns via `out pins, 20` (GP1 base, 20 contiguous pins); CPU manages rows (split pin ranges)
 - **Batch GPIO**: `gpio_set_mask64()` / `gpio_clr_mask64()` for pattern-independent row switching
-- **Core 1** runs USB stack independently — do not disable interrupts on Core 1
+- **Core 1** runs USB stack independently — paused via multicore lockout during scan bursts, resumes during idle
 - **Coordinate mapping**: layout (row,col) → schematic (row,col) uses NUM_COLOR=4 interleaving; see `utilities.cpp`
 
 ## Build & Flash
@@ -102,7 +108,7 @@ python3 test_firmware/single_led/auto_test.py cmd "BURST 10000"
 - **Phase 3c**: DMA-fed PIO — hybrid DMA columns + ISR row switching (0.58 µs/row overhead, CPU free between ISRs)
 - **Phase 3d**: Multi-SM PIO — dual PIO blocks (row SM on PIO1, col SM on PIO0) with bridge ISRs (0.37 µs/row overhead, ~3 µs jitter at 10 µs ON). Visually verified LEDs active during scanning.
 - **Phase 3e**: Burst-mode scanning — simulated 8 kHz trigger, `noInterrupts()` during scan burst. Confirmed zero jitter (0.000 µs) for PIOSCAN burst mode.
-- **Phase 4**: BCM grayscale — single-row-per-trigger BCM with 3 modes (PIO/DMA/MSM). Mode A (PIO) achieves 0.007 µs jitter, 0 outliers. 4-bit BCM at T=0.5 µs: 9.5 µs burst, fits 13 µs budget with 3.5 µs margin. 400 Hz frame rate.
+- **Phase 4**: BCM grayscale — single-row-per-trigger BCM with 3 modes (PIO/DMA/MSM). **Zero jitter achieved** with multicore lockout + noInterrupts + warm-up. Full sweep: 4 T values × 16 intensities × 10k frames at 8 kHz = 640k measurements, all showing 0.000 µs jitter, 0 outliers. 4-bit BCM at T=0.5 µs: 9.42 µs burst, fits 15 µs with 5.6 µs margin. 400 Hz frame rate. Visually verified (BCMDEMO ramp test).
 
 ## Key Technical Findings
 
@@ -135,28 +141,29 @@ At ON = 0.25–0.5 µs, 10k frames:
 
 MSMSCAN has lower overhead but its ISR-dependent jitter (11–23 µs at short ON) makes it unsuitable for the tight 15 µs window. MSMSCAN may still be useful for free-running BCM display where jitter tolerance is higher.
 
-### Burst-mode BCM achieves zero jitter (Phase 4 — RESOLVED)
-Single-row-per-trigger BCM with `noInterrupts()` during the scan burst (Mode A / PIOSCAN) gives **0.007 µs jitter** (1 CPU cycle) and **0 outliers** across all tested configurations. The burst architecture — `noInterrupts()` for ~10 µs scan, `interrupts()` for ~115 µs idle — completely eliminates timing variation.
+### Burst-mode BCM achieves ZERO jitter with multicore lockout (Phase 4 — RESOLVED)
+Full jitter sweep: 4 T values × 16 intensities × 10k frames at 8 kHz = **640,000 measurements**. With the zero-jitter recipe (multicore lockout + noInterrupts for entire loop + 100-trigger warm-up), **every single measurement shows 0.000 µs jitter**. Zero outliers.
 
-### BCM burst timing budget (Phase 4 results)
-At 150 MHz, 8 kHz trigger, Mode A (PIO + noInterrupts):
-| Config | Burst (µs) | Jitter (µs) | Fits 13µs? | Margin |
-|--------|-----------|-------------|------------|--------|
-| 4-bit T=0.50µs | 9.51 | 0.007 | YES | 3.5µs |
-| 4-bit T=0.25µs | 5.77 | 0.007 | YES | 7.2µs |
-| 4-bit T=0.75µs | 13.27 | 0.007 | NO | -0.3µs |
-| 3-bit T=1.00µs | 8.59 | 0.007 | YES | 4.4µs |
-| 3-bit T=1.50µs | 12.09 | 0.007 | YES | 0.9µs |
+**Jitter root cause and fix**: Without multicore lockout, Core 1 USB stack creates bus contention (0.7-2.2 µs jitter). `noInterrupts()` alone is insufficient because it only disables Core 0 interrupts — Core 1 continues running. The fix requires all three ingredients: (1) `multicore_lockout_start_blocking()` to pause Core 1, (2) `noInterrupts()` for the entire measurement loop, (3) 100-trigger warm-up inside the lockout to stabilize pipeline/branch predictor state.
 
-**Recommended**: 4-bit BCM, T=0.5 µs → 16 intensity levels, 9.5 µs burst, 3.5 µs margin. Frame rate = 400 Hz.
+### BCM burst timing budget (Phase 4 — zero jitter)
+At 150 MHz, 8 kHz trigger, Mode A (PIO + multicore lockout + noInterrupts + warm-up):
+| T (µs) | Burst (µs) | Jitter (µs) | Outliers | Fits 13 µs? | Fits 15 µs? | Margin |
+|---------|-----------|-------------|----------|-------------|-------------|--------|
+| 0.25 | 5.687 | **0.000** | 0/160k | YES | YES | 9.3 µs |
+| 0.50 | 9.420 | **0.000** | 0/160k | YES | YES | 5.6 µs |
+| 0.75 | 13.187 | **0.000** | 0/160k | ~YES | YES | 1.8 µs |
+| 1.00 | 16.920 | **0.000** | 0/160k | NO | NO | -1.9 µs |
 
-Modes B (DMA) and C (MSM/DMA) are ~1.3 µs faster but introduce 0.7–5.5 µs jitter from DMA interrupt overhead. Mode A is the only mode suitable for 2P sync.
+**Recommended**: 4-bit BCM, T=0.5 µs → 16 intensity levels, 9.42 µs burst, 5.6 µs margin to 15 µs budget. Frame rate = 400 Hz.
+
+Modes B (DMA) and C (MSM/DMA) are ~1.3 µs faster but introduce jitter from DMA interrupt overhead. Mode A is the only mode suitable for 2P sync.
 
 ## Next Steps
 
 ### Immediate
 1. **External trigger interface** — GPIO interrupt or PIO `wait pin` for 2P sync. Replace simulated DWT trigger with real hardware input from microscope.
-2. **Overclock to 200 MHz** — Optional. Would expand T range (4-bit T≤1.0 µs in 13 µs) but not required since T=0.5 µs already works at 150 MHz.
+2. **Overclock to 200 MHz** — Optional. Would expand T range (4-bit T≤1.0 µs in 15 µs) but not required since T=0.5 µs already works at 150 MHz.
 
 ### After trigger is working
 - **Optical characterization** — photodiode + external ADC to measure LED linearity, rise/fall time, load-dependent brightness. Build calibration LUT if needed.
@@ -166,7 +173,8 @@ Modes B (DMA) and C (MSM/DMA) are ~1.3 µs faster but introduce 0.7–5.5 µs ji
 - ~~**Multi-SM PIO (MSMSCAN)**~~ — Implemented (Phase 3d). Lowest overhead (0.37 µs) but ISR-dependent jitter makes it unsuitable for 2P sync.
 - ~~**Pure DMA-fed PIO**~~ — Ruled out. SIO GPIO is not DMA-accessible.
 - ~~**Burst-mode jitter**~~ — Measured (Phase 3e). Zero jitter confirmed with `noInterrupts()` burst architecture.
-- ~~**BCM grayscale**~~ — Implemented (Phase 4). 4-bit BCM at T=0.5 µs fits in 9.5 µs with 3.5 µs margin. Zero jitter, zero outliers.
+- ~~**BCM grayscale**~~ — Implemented (Phase 4). 4-bit BCM at T=0.5 µs: 9.42 µs burst, 0.000 µs jitter, 5.6 µs margin. Zero jitter achieved with multicore lockout + noInterrupts + warm-up.
+- ~~**Multicore lockout for zero jitter**~~ — Implemented. `multicore_lockout_start_blocking()` + `noInterrupts()` for entire loop + 100-trigger warm-up = 0.000 µs jitter across 640k measurements.
 
 **Guiding principle**: Jitter and timing budget compliance come first. Mode A (PIO + noInterrupts) is the production architecture.
 
@@ -180,6 +188,7 @@ Modes B (DMA) and C (MSM/DMA) are ~1.3 µs faster but introduce 0.7–5.5 µs ji
 - `test_firmware/single_led/RESULTS.md` — detailed engineering results
 - `test_firmware/single_led/auto_test.py` — autonomous build/flash/test runner (preferred for all testing)
 - `test_firmware/single_led/status_dashboard.py` — status visibility for user (watch /tmp/g6_test_status.txt)
+- `test_firmware/single_led/bcm_jitter_sweep.py` — BCM jitter sweep (4 T × 16 intensities × 10k frames)
 - `test_firmware/single_led/run_tests.py` — automated serial test harness (legacy)
 - `test_firmware/single_led/visual_test.py` — interactive visual verification
 
@@ -191,6 +200,6 @@ PIO: `PIOSCAN n`, `PIOSCAN2 n` (unprotected), `PIOROWTIME n`
 Hybrid DMA+ISR: `DMASCAN n`, `DMATEST`
 Multi-SM PIO: `MSMSCAN n`, `MSMTEST`
 Burst mode (2P sync sim): `BURST n [rate_hz]` — default 8 kHz trigger rate, `noInterrupts()` during scan burst
-BCM burst (Phase 4): `BCM bits`, `BCMON us`, `FILL intensity`, `GRADIENT`, `BCMBURST n [Hz] [A|B|C]`
+BCM burst (Phase 4): `BCM bits`, `BCMON us`, `FILL intensity`, `GRADIENT`, `BCMBURST n [Hz] [A|B|C]`, `BCMDEMO`
 System: `REBOOT` (enters BOOTSEL mode for flashing)
 `HELP` for full list.
