@@ -31,13 +31,14 @@ Characterize and optimize LED timing on G6 20×20 passive LED matrix panels driv
 
 ## Key Technical Details
 
-- **Zero jitter recipe** (3 ingredients, ALL required):
-  1. `__not_in_flash_func()` on all timing code (avoids XIP cache eviction)
-  2. `noInterrupts()` on Core 0 for the entire scan loop (not just per-burst)
+- **Zero jitter recipe** (4 ingredients, ALL required):
+  1. `__not_in_flash_func()` **+ `__attribute__((noinline))`** on all timing code — prevents XIP cache eviction AND prevents compiler from silently inlining into flash callers
+  2. `noInterrupts()` on Core 0 for the entire scan loop
   3. `multicore_lockout_start_blocking()` to pause Core 1 during scan (eliminates bus contention)
   4. 100-trigger warm-up inside lockout before measurement (eliminates cold-start pipeline artifacts)
-  - **Without all 3**: jitter is 0.7-2.2 µs. **With all 3**: jitter = 0.000 µs across 640k measurements.
-- **Core 1 lockout setup**: `setup1()` must call `multicore_lockout_victim_init()` so Core 1 can be paused
+  - **Without all 4**: jitter is 0.7-7+ µs. **With all 4**: jitter = 0.007 µs (1 CPU cycle).
+- **CRITICAL: `noinline` is mandatory with `__not_in_flash_func`**: The compiler can inline `static __not_in_flash_func` functions into flash-resident callers, silently defeating the SRAM placement. This caused a 0→7 µs jitter regression that was very difficult to diagnose. Always use `__attribute__((noinline))` together with `__not_in_flash_func()` on timing-critical functions.
+- **Core 1 lockout setup**: `setup1()` must call `multicore_lockout_victim_init()` AND `loop1()` must be defined (even if empty) for Arduino-Pico compatibility
 - **DWT cycle counter** for timing: `m33_hw->dwt_cyccnt` via `#include <hardware/structs/m33.h>`
 - **PIO** drives columns via `out pins, 20` (GP1 base, 20 contiguous pins); CPU manages rows (split pin ranges)
 - **Batch GPIO**: `gpio_set_mask64()` / `gpio_clr_mask64()` for pattern-independent row switching
@@ -108,7 +109,8 @@ python3 test_firmware/single_led/auto_test.py cmd "BURST 10000"
 - **Phase 3c**: DMA-fed PIO — hybrid DMA columns + ISR row switching (0.58 µs/row overhead, CPU free between ISRs)
 - **Phase 3d**: Multi-SM PIO — dual PIO blocks (row SM on PIO1, col SM on PIO0) with bridge ISRs (0.37 µs/row overhead, ~3 µs jitter at 10 µs ON). Visually verified LEDs active during scanning.
 - **Phase 3e**: Burst-mode scanning — simulated 8 kHz trigger, `noInterrupts()` during scan burst. Confirmed zero jitter (0.000 µs) for PIOSCAN burst mode.
-- **Phase 4**: BCM grayscale — single-row-per-trigger BCM with 3 modes (PIO/DMA/MSM). **Zero jitter achieved** with multicore lockout + noInterrupts + warm-up. Full sweep: 4 T values × 16 intensities × 10k frames at 8 kHz = 640k measurements, all showing 0.000 µs jitter, 0 outliers. 4-bit BCM at T=0.5 µs: 9.42 µs burst, fits 15 µs with 5.6 µs margin. 400 Hz frame rate. Visually verified (BCMDEMO ramp test).
+- **Phase 4**: BCM grayscale — single-row-per-trigger BCM with 3 modes (PIO/DMA/MSM). **Zero jitter achieved** with multicore lockout + noInterrupts + noinline + warm-up. Full sweep: 640k measurements, all showing 0.007 µs jitter (1 cycle), 0 outliers. 4-bit BCM at T=0.5 µs: 9.49 µs burst, fits 15 µs with 5.5 µs margin. 400 Hz frame rate. Visually verified (BCMDEMO ramp test).
+- **Phase 5a**: RAMBURST — production-realistic frame loading. 8 test frames cycling at 400 Hz from RAM, incremental per-row precompute (38 µs/row during 115 µs idle). **0.007 µs jitter** with frame swaps happening. Critical `noinline` bug found and fixed: compiler was silently inlining `__not_in_flash_func` into flash callers.
 
 ## Key Technical Findings
 
@@ -174,7 +176,9 @@ Modes B (DMA) and C (MSM/DMA) are ~1.3 µs faster but introduce jitter from DMA 
 - ~~**Pure DMA-fed PIO**~~ — Ruled out. SIO GPIO is not DMA-accessible.
 - ~~**Burst-mode jitter**~~ — Measured (Phase 3e). Zero jitter confirmed with `noInterrupts()` burst architecture.
 - ~~**BCM grayscale**~~ — Implemented (Phase 4). 4-bit BCM at T=0.5 µs: 9.42 µs burst, 0.000 µs jitter, 5.6 µs margin. Zero jitter achieved with multicore lockout + noInterrupts + warm-up.
-- ~~**Multicore lockout for zero jitter**~~ — Implemented. `multicore_lockout_start_blocking()` + `noInterrupts()` for entire loop + 100-trigger warm-up = 0.000 µs jitter across 640k measurements.
+- ~~**Multicore lockout for zero jitter**~~ — Implemented. lockout + noInterrupts + noinline + warm-up = 0.007 µs jitter.
+- ~~**`noinline` requirement for `__not_in_flash_func`**~~ — Discovered (Phase 5a). Compiler silently inlines static `__not_in_flash_func` into flash callers, defeating SRAM placement. Caused 0→7 µs jitter regression. Fix: always pair with `__attribute__((noinline))`.
+- ~~**RAM frame loading at 400 Hz**~~ — Validated (Phase 5a RAMBURST). Incremental per-row precompute (38 µs/row) fits in 115 µs idle. 0.007 µs jitter with 8-frame cycling.
 
 **Guiding principle**: Jitter and timing budget compliance come first. Mode A (PIO + noInterrupts) is the production architecture.
 
@@ -184,8 +188,9 @@ Modes B (DMA) and C (MSM/DMA) are ~1.3 µs faster but introduce jitter from DMA 
 - `test_firmware/single_led/src/constants.h/.cpp` — pin definitions
 - `test_firmware/single_led/src/utilities.h/.cpp` — coordinate mapping
 - `test_firmware/single_led/platformio.ini` — build config
+- `test_firmware/single_led/PRODUCTION_ARCHITECTURE.md` — comprehensive production design document
 - `test_firmware/single_led/G6_PANEL_TIMING_REPORT_v2.md` — shareable timing report
-- `test_firmware/single_led/RESULTS.md` — detailed engineering results
+- `test_firmware/single_led/RESULTS.md` — detailed engineering results (Phases 0-5a)
 - `test_firmware/single_led/auto_test.py` — autonomous build/flash/test runner (preferred for all testing)
 - `test_firmware/single_led/status_dashboard.py` — status visibility for user (watch /tmp/g6_test_status.txt)
 - `test_firmware/single_led/bcm_jitter_sweep.py` — BCM jitter sweep (4 T × 16 intensities × 10k frames)
@@ -201,5 +206,6 @@ Hybrid DMA+ISR: `DMASCAN n`, `DMATEST`
 Multi-SM PIO: `MSMSCAN n`, `MSMTEST`
 Burst mode (2P sync sim): `BURST n [rate_hz]` — default 8 kHz trigger rate, `noInterrupts()` during scan burst
 BCM burst (Phase 4): `BCM bits`, `BCMON us`, `FILL intensity`, `GRADIENT`, `BCMBURST n [Hz] [A|B|C]`, `BCMDEMO`
+RAM burst (Phase 5a): `RAMBURST n [Hz] [n_frames] [P]` — frame cycling from RAM, P=pre-emptive noInterrupts
 System: `REBOOT` (enters BOOTSEL mode for flashing)
 `HELP` for full list.

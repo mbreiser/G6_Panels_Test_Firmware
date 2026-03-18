@@ -1003,9 +1003,75 @@ All tests: 20 rows, pattern 0xFFFFF (all columns ON), 10,000 frames. LEDs visual
 
 ---
 
+## Phase 3e: Burst-Mode Scanning
+
+- Simulated 8 kHz external trigger using DWT cycle counter phase-locked loop
+- `noInterrupts()` during ~10 µs scan burst, `interrupts()` during ~115 µs idle
+- Confirmed zero jitter (0.000 µs) for PIOSCAN burst mode at all ON times
+- Architecture: short burst + long idle perfectly matches 2P microscope timing
+
+---
+
+## Phase 4: BCM Grayscale with Zero Jitter
+
+### BCM Architecture
+- Single-row-per-trigger: each 8 kHz trigger scans ONE row through all BCM bit-planes
+- 20 triggers = 1 full frame → 400 Hz frame rate
+- 4-bit BCM = 16 intensity levels, base time T configurable
+- Three modes implemented: A (PIO+CPU), B (DMA+PIO), C (MSM/DMA)
+
+### BCM Burst Timing (Mode A, per-row, 150 MHz)
+
+| Config | Burst (µs) | Fits 13µs? | Fits 15µs? |
+|--------|-----------|------------|------------|
+| 4-bit T=0.25µs | 5.687 | YES | YES |
+| 4-bit T=0.50µs | 9.420 | YES | YES |
+| 4-bit T=0.75µs | 13.187 | ~YES | YES |
+| 4-bit T=1.00µs | 16.920 | NO | NO |
+
+### Zero-Jitter Achievement
+
+Full jitter sweep: 4 T values × 16 intensities × 10,000 frames = 640,000 measurements at 8 kHz.
+
+**Result: 0.000 µs jitter across ALL 640,000 measurements. Zero outliers.**
+
+The zero-jitter recipe requires three ingredients (all mandatory):
+1. `multicore_lockout_start_blocking()` — pauses Core 1 USB stack, eliminating bus contention
+2. `noInterrupts()` for the entire scan loop (not just per-burst)
+3. 100-trigger warm-up inside lockout before measurement — stabilizes CPU pipeline
+
+Without multicore lockout: 0.7-2.2 µs jitter (Core 1 bus contention)
+Without warm-up: 0.7 µs sporadic jitter (cold-start pipeline artifacts)
+
+### Per-Burst noInterrupts Relaxation Test
+
+For production, full-loop noInterrupts is impractical (need to service SPI between triggers).
+Tested per-burst noInterrupts (interrupts enabled during idle):
+
+| Configuration | Max jitter | Events per 10k |
+|--------------|-----------|----------------|
+| Full lockout + full-loop noInterrupts + warmup | 0.000 µs | 0 |
+| Full lockout + per-burst noInterrupts + warmup | 0.8 µs | ~1 |
+| Full lockout + per-burst + SysTick disabled | 0.8 µs | ~1 |
+
+Root cause of 0.8 µs: CPU pipeline/branch predictor state disruption at noInterrupts boundary. NOT from any specific interrupt source (persists with all interrupts disabled).
+
+### Mode Comparison (BCM burst, single-row-per-trigger)
+
+| Mode | Burst T=0.5µs | Jitter | Notes |
+|------|--------------|--------|-------|
+| A (PIO+CPU) | 9.42 µs | 0.000 µs | Production choice |
+| B (DMA+PIO) | ~8.1 µs | 0.7-5.5 µs | DMA bus arbitration |
+| C (MSM/DMA) | ~8.1 µs | 0.7-5.5 µs | Same as B |
+
+Mode A selected for production: highest jitter immunity, fits 15 µs budget with 5.6 µs margin.
+
+---
+
 ## Next Steps
 
-- **Phase 4**: BCM grayscale implementation and characterization
-- **External trigger interface** — GPIO interrupt or PIO `wait pin` for 2P sync
-- **Optical characterization** — photodiode measurements of linearity, rise/fall time
-- Phase 2 (timing method comparison) is **skipped** — DWT + RAM execution provides perfect timing
+- **Phase 5a**: External trigger via PIO `wait pin`
+- **Phase 5b**: SPI slave via PIO + DMA for frame data
+- **Phase 5c**: Double buffering + production loop integration
+- **Phase 5d**: Optical characterization with photodiode
+- **Phase 5e**: Overclock to 200 MHz (optional, not required at T=0.5µs)

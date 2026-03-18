@@ -48,7 +48,7 @@ static void dwt_init() {
     }
 }
 
-static void __not_in_flash_func(dwt_delay_cycles)(uint32_t cycles) {
+static void __attribute__((noinline)) __not_in_flash_func(dwt_delay_cycles)(uint32_t cycles) {
     uint32_t start = m33_hw->dwt_cyccnt;
     while ((m33_hw->dwt_cyccnt - start) < cycles) { /* spin */ }
 }
@@ -93,7 +93,7 @@ static void stats_reset() {
     // Note: stat_outlier_threshold is set by the caller before measurement
 }
 
-static void __not_in_flash_func(stats_update)(uint32_t on_cyc, uint32_t off_cyc) {
+static void __attribute__((noinline)) __not_in_flash_func(stats_update)(uint32_t on_cyc, uint32_t off_cyc) {
     if (on_cyc < stat_on_min) stat_on_min = on_cyc;
     if (on_cyc > stat_on_max) stat_on_max = on_cyc;
     stat_on_sum += on_cyc;
@@ -212,6 +212,14 @@ static float    bcm_base_on_us = 0.5f;                   // base time unit T (µ
 static uint8_t  pixel_data[PANEL_SIZE][PANEL_SIZE];       // intensity per pixel
 static uint32_t bcm_plane_data[PANEL_SIZE][8][2];         // [row][bit] = {pio_pattern, pio_delay}
 
+// RAMBURST state (Phase 5 — production simulation)
+// Test frames stored in PSRAM (not SRAM!) to avoid disrupting SRAM layout
+// of timing-critical code. SRAM layout sensitivity causes jitter regression.
+#define MAX_TEST_FRAMES 16
+static uint8_t  (*test_frames)[PANEL_SIZE][PANEL_SIZE] = nullptr;  // allocated in PSRAM
+static uint8_t  n_test_frames = 0;
+static uint8_t  current_frame_idx = 0;
+
 static void precompute_scan_masks() {
     // Row masks (schematic row pins)
     for (int r = 0; r < PANEL_SIZE; r++) {
@@ -272,6 +280,34 @@ static void precompute_bcm_data() {
             for (int b = 0; b < bcm_bits; b++) {
                 if (intensity & (1 << b)) {
                     // Clear this column's bit → drive LOW → LED ON
+                    bcm_plane_data[sch_row][b][0] &= ~(1UL << sch_col);
+                }
+            }
+        }
+    }
+}
+
+// Incremental precompute: compute BCM plane data for a single schematic row.
+// Call once per idle window → spread ~173 µs across 20 windows = ~8.65 µs each.
+static void precompute_bcm_row(uint8_t sch_row) {
+    uint32_t base_cycles = (uint32_t)(bcm_base_on_us * cycles_per_us);
+
+    // Init this row's planes to all-OFF
+    for (int b = 0; b < bcm_bits; b++) {
+        uint32_t on_cycles_b = base_cycles * (1U << b);
+        bcm_plane_data[sch_row][b][0] = 0xFFFFF;
+        bcm_plane_data[sch_row][b][1] = (on_cycles_b > PIO_ON_OVERHEAD_CYCLES)
+                                       ? (on_cycles_b - PIO_ON_OVERHEAD_CYCLES) : 0;
+    }
+
+    // Scan all layout pixels that map to this schematic row
+    for (int lr = 0; lr < PANEL_SIZE; lr++) {
+        for (int lc = 0; lc < PANEL_SIZE; lc++) {
+            if (layout_to_sch_row[lr][lc] != sch_row) continue;
+            uint8_t sch_col = layout_to_sch_col[lr][lc];
+            uint8_t intensity = pixel_data[lr][lc];
+            for (int b = 0; b < bcm_bits; b++) {
+                if (intensity & (1 << b)) {
                     bcm_plane_data[sch_row][b][0] &= ~(1UL << sch_col);
                 }
             }
@@ -448,7 +484,7 @@ static bool dma_init_channel() {
 // after each row's delay completes (columns already OFF).
 // Order matters: row switch BEFORE clearing PIO IRQ, because clearing the
 // IRQ releases PIO which immediately pulls column data and drives columns ON.
-static void __not_in_flash_func(pio_row_isr)() {
+static void __attribute__((noinline)) __not_in_flash_func(pio_row_isr)() {
     // Clear previous row (columns are already OFF from PIO)
     gpio_clr_mask64(row_on_mask[isr_current_row]);
 
@@ -665,7 +701,7 @@ static uint32_t __not_in_flash_func(run_hybrid_single_frame)() {
 }
 
 // Run N hybrid scan frames with timing statistics.
-static void __not_in_flash_func(run_hybrid_scan_frames)(uint32_t n_frames) {
+static void __attribute__((noinline)) __not_in_flash_func(run_hybrid_scan_frames)(uint32_t n_frames) {
     stats_reset();
     if (!dwt_available) {
         Serial.println("ERR: DWT not available");
@@ -882,13 +918,13 @@ static void msm_precompute_row_patterns() {
 static volatile uint32_t msm_rows_done;
 
 // PIO1 IRQ0 handler: row SM set flag 0 → wake col SM on PIO0
-static void __not_in_flash_func(msm_row_to_col_isr)() {
+static void __attribute__((noinline)) __not_in_flash_func(msm_row_to_col_isr)() {
     pio_interrupt_clear(msm_row_pio, 0);       // clear PIO1 flag 0
     msm_col_pio->irq_force = (1u << 0);        // force PIO0 flag 0 → col SM wakes
 }
 
 // PIO0 IRQ0 handler: col SM set flag 1 → wake row SM on PIO1
-static void __not_in_flash_func(msm_col_to_row_isr)() {
+static void __attribute__((noinline)) __not_in_flash_func(msm_col_to_row_isr)() {
     pio_interrupt_clear(msm_col_pio, 1);       // clear PIO0 flag 1
     msm_row_pio->irq_force = (1u << 1);        // force PIO1 flag 1 → row SM wakes
     msm_rows_done++;                            // count completed rows
@@ -1110,7 +1146,7 @@ static void msm_irq_disable() {
 // Helper: set pindirs for row and col SMs via forced exec.
 // Uses `set pindirs, 0x1F` (5 bits at a time) with temporarily set SET_BASE.
 // This avoids issues with pio_sm_set_consecutive_pindirs + GPIOBASE.
-static void __not_in_flash_func(msm_set_all_pindirs)() {
+static void __attribute__((noinline)) __not_in_flash_func(msm_set_all_pindirs)() {
     // Row SM on PIO1 (GPIOBASE=16): set 24 pins as output starting at GP21
     // Use out exec: push 0xFFFFFFFF, then exec "out pindirs, 24"
     {
@@ -1191,7 +1227,7 @@ static uint32_t __not_in_flash_func(msm_run_single_frame)() {
 }
 
 // Run N multi-SM scan frames with timing statistics.
-static void __not_in_flash_func(msm_run_scan_frames)(uint32_t n_frames) {
+static void __attribute__((noinline)) __not_in_flash_func(msm_run_scan_frames)(uint32_t n_frames) {
     stats_reset();
     if (!dwt_available) {
         Serial.println("ERR: DWT not available");
@@ -1615,7 +1651,7 @@ static void msm_debug_test() {
 //
 // This is the definitive jitter test for the application.
 
-static void __not_in_flash_func(run_burst_scan)(
+static void __attribute__((noinline)) __not_in_flash_func(run_burst_scan)(
     uint32_t n_triggers, float trigger_rate_hz)
 {
     stats_reset();
@@ -1794,7 +1830,9 @@ static void cmd_burst(const char* arg) {
 // all bit-planes. Rows cycle across triggers → full frame at 400 Hz.
 
 // Mode A: PIO burst BCM (PIOSCAN-based, noInterrupts during burst)
-static void __not_in_flash_func(run_bcm_burst_pio)(
+// noinline prevents compiler from inlining this into flash-resident callers,
+// which would defeat __not_in_flash_func and cause XIP cache jitter.
+static void __attribute__((noinline)) __not_in_flash_func(run_bcm_burst_pio)(
     uint32_t n_triggers, float trigger_rate_hz)
 {
     stats_reset();
@@ -1841,17 +1879,12 @@ static void __not_in_flash_func(run_bcm_burst_pio)(
     gpio_clr_mask64(row_on_mask[0]);
     interrupts();
 
-    // Lock out Core 1 + disable all Core 0 interrupts for ENTIRE measurement.
-    // This eliminates ALL sources of timing variation:
-    //   - Core 1 bus contention (multicore lockout)
-    //   - Core 0 interrupt servicing between bursts (noInterrupts for entire loop)
-    // USB will be unresponsive for ~1.25s at 10k/8kHz. Acceptable for measurement.
+    // Lock out Core 1 — eliminates bus contention from USB stack.
+    // Core 1 stays locked for the entire measurement (~1.25s at 10k/8kHz).
     multicore_lockout_start_blocking();
-    noInterrupts();
 
-    // Warm-up: run 100 full trigger cycles (all 20 rows × 5 frames) to
-    // stabilize pipeline, branch predictor, and bus arbitration state.
-    // This eliminates cold-start jitter artifacts.
+    // Warm-up: 100 trigger cycles with noInterrupts to stabilize pipeline.
+    noInterrupts();
     {
         uint8_t wr = 0;
         uint32_t wu_start = m33_hw->dwt_cyccnt;
@@ -1870,18 +1903,20 @@ static void __not_in_flash_func(run_bcm_burst_pio)(
             if (wr >= active_rows) wr = 0;
         }
     }
+    interrupts();
     stats_reset();  // clear any stats from warm-up
+
+    // Full-loop noInterrupts for zero-jitter measurement
+    noInterrupts();
 
     // Main trigger loop
     uint32_t trigger_start = m33_hw->dwt_cyccnt;
     uint8_t row = 0;
 
     for (uint32_t t = 0; t < n_triggers; t++) {
-        // Wait for next trigger edge (simulated)
         while ((m33_hw->dwt_cyccnt - trigger_start) < trigger_period_cyc) {}
         trigger_start += trigger_period_cyc;
 
-        // --- Scan burst: one row, all bit-planes ---
         uint32_t burst_start = m33_hw->dwt_cyccnt;
 
         gpio_set_mask64(row_on_mask[row]);
@@ -1909,7 +1944,7 @@ static void __not_in_flash_func(run_bcm_burst_pio)(
 }
 
 // Mode B: DMA burst BCM (DMA feeds PIO, CPU polls completion)
-static void __not_in_flash_func(run_bcm_burst_dma)(
+static void __attribute__((noinline)) __not_in_flash_func(run_bcm_burst_dma)(
     uint32_t n_triggers, float trigger_rate_hz)
 {
     stats_reset();
@@ -2017,7 +2052,7 @@ static void __not_in_flash_func(run_bcm_burst_dma)(
 // Mode C: MSM burst BCM (col SM on PIO0, row held by CPU)
 // Uses the MSM column SM but row is held constant by CPU GPIO.
 // No bridge ISRs needed since row doesn't change during burst.
-static void __not_in_flash_func(run_bcm_burst_msm)(
+static void __attribute__((noinline)) __not_in_flash_func(run_bcm_burst_msm)(
     uint32_t n_triggers, float trigger_rate_hz)
 {
     stats_reset();
@@ -2413,6 +2448,284 @@ static void cmd_bcmdemo() {
 }
 
 // ---------------------------------------------------------------------------
+// RAMBURST: production simulation with frame cycling from RAM
+// Tests double-buffering + precompute at 400 Hz frame rate.
+// Pre-stores test patterns in RAM, cycles through them at frame boundaries.
+// ---------------------------------------------------------------------------
+
+static void init_test_frames_ramp(uint8_t n_frames) {
+    // Allocate test frames in heap (PSRAM on RP2354) to avoid SRAM disruption
+    if (test_frames == nullptr) {
+        test_frames = (uint8_t (*)[PANEL_SIZE][PANEL_SIZE])
+            malloc(MAX_TEST_FRAMES * PANEL_SIZE * PANEL_SIZE);
+        if (test_frames == nullptr) {
+            Serial.println("ERR: failed to allocate test frames");
+            return;
+        }
+    }
+    // Create n_frames of uniform intensity: 0, 1, 2, ..., max
+    n_test_frames = (n_frames > MAX_TEST_FRAMES) ? MAX_TEST_FRAMES : n_frames;
+    int max_val = (1 << bcm_bits) - 1;
+    for (uint8_t f = 0; f < n_test_frames; f++) {
+        uint8_t intensity = (uint8_t)((f * max_val) / (n_test_frames - 1));
+        if (n_test_frames == 1) intensity = max_val;
+        for (int r = 0; r < PANEL_SIZE; r++)
+            for (int c = 0; c < PANEL_SIZE; c++)
+                test_frames[f][r][c] = intensity;
+    }
+}
+
+static void __attribute__((noinline)) __not_in_flash_func(run_ramburst)(
+    uint32_t n_triggers, float trigger_rate_hz, bool preemptive_noint)
+{
+    stats_reset();
+    if (!dwt_available) {
+        Serial.println("ERR: DWT not available");
+        return;
+    }
+
+    precompute_scan_masks();
+
+    uint32_t trigger_period_cyc = (uint32_t)(cycles_per_us * 1000000.0f / trigger_rate_hz);
+
+    // Compute outlier threshold
+    uint32_t base_cycles = (uint32_t)(bcm_base_on_us * cycles_per_us);
+    uint32_t nominal_burst_cyc = 0;
+    for (int b = 0; b < bcm_bits; b++) {
+        nominal_burst_cyc += base_cycles * (1U << b) + PIO_ON_OVERHEAD_CYCLES + 50;
+    }
+    stat_outlier_threshold = nominal_burst_cyc * 2;
+
+    // Pre-emptive noInterrupts guard (Strategy A):
+    // Enter noInterrupts this many cycles BEFORE expected trigger.
+    // Pipeline/branch predictor settles during the wait.
+    uint32_t guard_cyc = preemptive_noint ? (uint32_t)(5.0f * cycles_per_us) : 0;
+
+    // Initial precompute from frame 0
+    current_frame_idx = 0;
+    memcpy(pixel_data, test_frames[0], sizeof(pixel_data));
+    precompute_bcm_data();
+
+    // Reset PIO SM
+    pio_sm_set_enabled(pio_hw_inst, pio_sm_idx, false);
+    pio_sm_clear_fifos(pio_hw_inst, pio_sm_idx);
+    pio_sm_restart(pio_hw_inst, pio_sm_idx);
+    pio_sm_set_consecutive_pindirs(pio_hw_inst, pio_sm_idx, COL_PIN[0], PANEL_SIZE, true);
+    pio_sm_exec(pio_hw_inst, pio_sm_idx, pio_encode_jmp(pio_offset));
+    pio_interrupt_clear(pio_hw_inst, 0);
+    pio_sm_set_enabled(pio_hw_inst, pio_sm_idx, true);
+    pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, 0xFFFFF);
+
+    // Lock out Core 1
+    multicore_lockout_start_blocking();
+
+    // Warm-up (100 triggers with noInterrupts)
+    noInterrupts();
+    {
+        uint8_t wr = 0;
+        uint32_t wu_start = m33_hw->dwt_cyccnt;
+        for (uint32_t w = 0; w < 100; w++) {
+            while ((m33_hw->dwt_cyccnt - wu_start) < trigger_period_cyc) {}
+            wu_start += trigger_period_cyc;
+            gpio_set_mask64(row_on_mask[wr]);
+            for (int b = 0; b < bcm_bits; b++) {
+                pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, bcm_plane_data[wr][b][0]);
+                pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, bcm_plane_data[wr][b][1]);
+                while (!pio_interrupt_get(pio_hw_inst, 0)) {}
+                pio_interrupt_clear(pio_hw_inst, 0);
+            }
+            gpio_clr_mask64(row_on_mask[wr]);
+            wr++;
+            if (wr >= active_rows) wr = 0;
+        }
+    }
+    interrupts();
+    stats_reset();
+
+    // Disable SysTick during scan
+    systick_hw->csr &= ~1u;
+
+    // Timing for precompute measurement
+    uint32_t precompute_cyc_total = 0;
+    uint32_t precompute_count = 0;
+
+    // Main trigger loop
+    uint32_t trigger_start = m33_hw->dwt_cyccnt;
+    uint8_t row = 0;
+    uint32_t frame_swaps = 0;
+
+    for (uint32_t t = 0; t < n_triggers; t++) {
+        // --- IDLE PHASE: between triggers ---
+        // Incremental precompute: at each trigger, precompute the NEXT row's
+        // BCM data. When row wraps to 0 (frame boundary), swap to next frame.
+        // This spreads 173µs of precompute across 20 idle windows (~8.7µs each).
+        if (n_test_frames > 1) {
+            // At frame boundary: swap to next test frame
+            if (row == 0 && t > 0) {
+                current_frame_idx = (current_frame_idx + 1) % n_test_frames;
+                memcpy(pixel_data, test_frames[current_frame_idx], sizeof(pixel_data));
+                frame_swaps++;
+            }
+
+            // Precompute the NEXT row that will be scanned (current row is
+            // already precomputed from the previous idle period or initial setup)
+            uint8_t next_row = (row + 1 >= active_rows) ? 0 : row + 1;
+            uint32_t pc_start = m33_hw->dwt_cyccnt;
+            precompute_bcm_row(next_row);
+            uint32_t pc_end = m33_hw->dwt_cyccnt;
+            precompute_cyc_total += (pc_end - pc_start);
+            precompute_count++;
+        }
+
+        if (preemptive_noint && guard_cyc > 0) {
+            // Strategy A: enter noInterrupts EARLY, before trigger time
+            uint32_t guard_target = trigger_start + trigger_period_cyc - guard_cyc;
+            while ((m33_hw->dwt_cyccnt - trigger_start) < (trigger_period_cyc - guard_cyc)) {}
+            noInterrupts();
+            // Now wait for actual trigger time
+            while ((m33_hw->dwt_cyccnt - trigger_start) < trigger_period_cyc) {}
+        } else {
+            // Wait for trigger, then disable interrupts
+            while ((m33_hw->dwt_cyccnt - trigger_start) < trigger_period_cyc) {}
+            noInterrupts();
+        }
+        trigger_start += trigger_period_cyc;
+
+        // --- BURST PHASE: one row, all bit-planes ---
+        uint32_t burst_start = m33_hw->dwt_cyccnt;
+
+        gpio_set_mask64(row_on_mask[row]);
+        for (int b = 0; b < bcm_bits; b++) {
+            pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, bcm_plane_data[row][b][0]);
+            pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, bcm_plane_data[row][b][1]);
+            while (!pio_interrupt_get(pio_hw_inst, 0)) {}
+            pio_interrupt_clear(pio_hw_inst, 0);
+        }
+        gpio_clr_mask64(row_on_mask[row]);
+
+        uint32_t burst_end = m33_hw->dwt_cyccnt;
+        interrupts();
+
+        stats_update(burst_end - burst_start, 0);
+
+        row++;
+        if (row >= active_rows) row = 0;
+    }
+
+    // Re-enable SysTick and resume Core 1
+    systick_hw->csr |= 1u;
+    multicore_lockout_end_blocking();
+
+    pio_sm_set_enabled(pio_hw_inst, pio_sm_idx, false);
+    all_off();
+
+    // Report
+    stats_print_fields("  RAMBURST", "burst", nullptr);
+
+    if (stat_count > 0) {
+        float mean_burst = cycles_to_us((uint32_t)(stat_on_sum / stat_count));
+        float period_us = 1000000.0f / trigger_rate_hz;
+        Serial.print("  Duty cycle: ");
+        Serial.print(100.0f * mean_burst / period_us, 1);
+        Serial.println("%");
+        Serial.print("  Fits in 13us? ");
+        Serial.println(mean_burst <= 13.0f ? "YES" : "NO");
+        Serial.print("  Fits in 15us? ");
+        Serial.println(mean_burst <= 15.0f ? "YES" : "NO");
+    }
+
+    Serial.print("  Frame swaps: ");
+    Serial.print(frame_swaps);
+    Serial.print(" (");
+    Serial.print(n_test_frames);
+    Serial.println(" frames in rotation)");
+
+    if (precompute_count > 0) {
+        float avg_precompute_us = cycles_to_us(precompute_cyc_total / precompute_count);
+        Serial.print("  Precompute avg: ");
+        Serial.print(avg_precompute_us, 3);
+        Serial.print("us (");
+        Serial.print(precompute_count);
+        Serial.println(" swaps)");
+    }
+
+    if (preemptive_noint) {
+        Serial.print("  Strategy A: pre-emptive noInterrupts, guard=");
+        Serial.print(cycles_to_us(guard_cyc), 1);
+        Serial.println("us");
+    }
+}
+
+static void cmd_ramburst(const char* arg) {
+    // Parse: RAMBURST <n_triggers> [rate_hz] [n_frames] [P]
+    // P = pre-emptive noInterrupts (Strategy A)
+    uint32_t n = 10000;
+    float rate = 8000.0f;
+    uint8_t nf = 8;
+    bool preemptive = false;
+
+    if (arg && *arg) {
+        char* end;
+        n = strtoul(arg, &end, 10);
+        if (n == 0 || n > 1000000) {
+            Serial.println("ERR: RAMBURST <1-1000000> [rate_hz] [n_frames] [P]");
+            return;
+        }
+        while (*end == ' ') end++;
+        if (*end >= '0' && *end <= '9') {
+            rate = strtof(end, &end);
+        }
+        while (*end == ' ') end++;
+        if (*end >= '0' && *end <= '9') {
+            nf = (uint8_t)strtoul(end, &end, 10);
+        }
+        while (*end == ' ') end++;
+        if (*end == 'P' || *end == 'p') {
+            preemptive = true;
+        }
+    }
+
+    if (!pio_loaded && !pio_init_program()) return;
+
+    bool was_running = running;
+    running = false;
+    all_off();
+    col_pins_to_pio();
+
+    // Initialize test frames (ramp pattern)
+    init_test_frames_ramp(nf);
+
+    // Drain serial buffer
+    delay(50);
+    while (Serial.available()) Serial.read();
+
+    Serial.println("--- RAMBURST START ---");
+    Serial.print("BCM bits=");
+    Serial.print(bcm_bits);
+    Serial.print("  Base T=");
+    Serial.print(bcm_base_on_us, 3);
+    Serial.print("us  Rows=");
+    Serial.print(active_rows);
+    Serial.print("  Triggers=");
+    Serial.print(n);
+    Serial.print("  Frames=");
+    Serial.print(n_test_frames);
+    Serial.print("  Rate=");
+    Serial.print(rate, 1);
+    Serial.print("Hz  Preemptive=");
+    Serial.println(preemptive ? "YES" : "NO");
+
+    run_ramburst(n, rate, preemptive);
+
+    Serial.println("--- RAMBURST END ---");
+
+    col_pins_to_sio();
+    stats_reset();
+    running = was_running;
+    if (running) count = 0;
+}
+
+// ---------------------------------------------------------------------------
 
 static char     cmd_buf[64];
 static uint8_t  cmd_len = 0;
@@ -2448,7 +2761,7 @@ static void led_off() {
 // ---------------------------------------------------------------------------
 // Single-LED pulse functions (from Phase 1e)
 // ---------------------------------------------------------------------------
-static void __not_in_flash_func(run_n_pulses)(uint32_t n, int mode) {
+static void __attribute__((noinline)) __not_in_flash_func(run_n_pulses)(uint32_t n, int mode) {
     stats_reset();
     if (!dwt_available) {
         Serial.println("ERR: DWT not available");
@@ -2495,7 +2808,7 @@ static void __not_in_flash_func(run_n_pulses)(uint32_t n, int mode) {
 // Measure row-switching overhead: column setup + row enable/disable, NO delay.
 // Runs N iterations, each doing active_rows row transitions.
 // Reports per-row overhead time.
-static void __not_in_flash_func(run_rowtime)(uint32_t n_iters) {
+static void __attribute__((noinline)) __not_in_flash_func(run_rowtime)(uint32_t n_iters) {
     stats_reset();
     if (!dwt_available) {
         Serial.println("ERR: DWT not available");
@@ -2548,7 +2861,7 @@ static void __not_in_flash_func(run_rowtime)(uint32_t n_iters) {
 // Full-frame scan: scan active_rows rows with on_cycles delay per row.
 // Runs up to N frames (interruptible — stops early if serial input arrives).
 // stats "on" field = frame time, "off" field = per-row average
-static void __not_in_flash_func(run_scan_frames)(uint32_t n_frames) {
+static void __attribute__((noinline)) __not_in_flash_func(run_scan_frames)(uint32_t n_frames) {
     stats_reset();
     if (!dwt_available) {
         Serial.println("ERR: DWT not available");
@@ -2616,7 +2929,7 @@ static void __not_in_flash_func(run_scan_frames)(uint32_t n_frames) {
 // ---------------------------------------------------------------------------
 
 // PIO row overhead: column setup + row enable/disable, minimum PIO delay.
-static void __not_in_flash_func(run_pio_rowtime)(uint32_t n_iters) {
+static void __attribute__((noinline)) __not_in_flash_func(run_pio_rowtime)(uint32_t n_iters) {
     stats_reset();
     if (!dwt_available) {
         Serial.println("ERR: DWT not available");
@@ -2671,7 +2984,7 @@ static void __not_in_flash_func(run_pio_rowtime)(uint32_t n_iters) {
 
 // PIO full-frame scan with per-frame timing measurement.
 // mode: 0 = with noInterrupts (for fair comparison), 1 = without (show PIO independence)
-static void __not_in_flash_func(run_pio_scan_frames)(uint32_t n_frames, int mode) {
+static void __attribute__((noinline)) __not_in_flash_func(run_pio_scan_frames)(uint32_t n_frames, int mode) {
     stats_reset();
     if (!dwt_available) {
         Serial.println("ERR: DWT not available");
@@ -3411,6 +3724,8 @@ static void process_command() {
         cmd_bcmburst(args);
     } else if (strcmp(cmd_buf, "BCMDEMO") == 0) {
         cmd_bcmdemo();
+    } else if (strcmp(cmd_buf, "RAMBURST") == 0) {
+        cmd_ramburst(args);
     } else if (strcmp(cmd_buf, "REBOOT") == 0) {
         Serial.println("Rebooting into BOOTSEL mode...");
         Serial.flush();
@@ -3448,15 +3763,13 @@ static void poll_serial() {
 // ---------------------------------------------------------------------------
 // Arduino setup
 // ---------------------------------------------------------------------------
-// Core 1: install multicore lockout handler so Core 0 can pause Core 1
-// during timing-critical scan bursts (eliminates bus contention jitter)
+// Core 1: install multicore lockout handler + empty loop.
+// Both setup1() and loop1() must be defined for lockout to work with Arduino-Pico.
 void setup1() {
     multicore_lockout_victim_init();
 }
-
 void loop1() {
-    // Arduino-Pico USB stack runs on Core 1 automatically.
-    // loop1 is intentionally empty — the USB stack uses interrupts.
+    // Empty — Arduino-Pico USB stack runs via interrupts on Core 1
 }
 
 void setup() {
