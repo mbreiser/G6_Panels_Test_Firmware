@@ -67,20 +67,26 @@ GP47 ─ unconnected
 
 ## 2. LED Polarity and PIO Impact
 
-### 2.1 Reversed Polarity (Current: Janelia Batch)
+### 2.1 Two Polarity Conventions
 
-The G6 panels in the current batch have **reversed LED polarity**:
-- **Column HIGH + Row LOW = LED ON** (current flows from column through LED to row)
-- **Column LOW + Row HIGH = LED OFF**
+The G6 panels exist in two LED polarity configurations:
 
-This is confirmed in both the iorodeo production firmware (`display.cpp`: `digitalWrite(COL_PIN(j), HIGH)` for ON, `gpio_put(ROW_PIN(i), 0)` for active row) and our test firmware.
+**Normal polarity (iorodeo panels):**
+- **Column HIGH + Row LOW = LED ON** (anode on column, cathode on row)
+- This is the convention used in the iorodeo production firmware (`display.cpp`: `digitalWrite(COL_PIN(j), HIGH)` for ON, `gpio_put(ROW_PIN(i), 0)` for active row)
+
+**Reversed polarity (Janelia batch — our test hardware):**
+- **Column LOW + Row HIGH = LED ON** (anode on row, cathode on column)
+- This is the convention used in our test firmware. Column patterns are inverted before PIO output (`pio_col_word = (~pattern) & 0xFFFFF`)
+
+**Important**: The iorodeo firmware was developed for their normal-polarity panels. It does NOT confirm reversed polarity. Our Janelia batch panels are reversed, which we discovered during Phase 1 testing. A future PCB revision should document which polarity the assembled panels use.
 
 ### 2.2 Impact on PIO Column Driving
 
 | Polarity | PIO pattern for "pixel ON" | All-OFF state | PIO program |
 |----------|---------------------------|---------------|-------------|
-| **Reversed (current)** | Bit = 1 (HIGH) | `0x00000` | `out pins, 20` directly |
-| Normal (if flipped) | Bit = 0 (LOW) | `0xFFFFF` | Either invert in software before push, or use `mov pins, ~osr` in PIO |
+| Normal (iorodeo) | Bit = 1 (HIGH) | `0x00000` | `out pins, 20` directly |
+| **Reversed (Janelia batch)** | Bit = 0 (LOW) | `0xFFFFF` | Invert in software before push, or use `mov pins, ~osr` in PIO |
 
 **Conclusion: LED polarity is a trivial software concern.** One XOR or one PIO instruction handles either polarity. It does not constrain pin assignment or PIO architecture.
 
@@ -90,8 +96,8 @@ For rows, only one row is active at a time:
 
 | Polarity | Active row signal | PIO pattern | CPU alternative |
 |----------|------------------|-------------|-----------------|
-| **Reversed (current)** | LOW (one-cold) | One `0` in field of `1`s | `gpio_clr_mask64` for ON, `gpio_set_mask64` for OFF |
-| Normal | HIGH (one-hot) | One `1` in field of `0`s | `gpio_set_mask64` for ON, `gpio_clr_mask64` for OFF |
+| Normal (iorodeo) | LOW (one-cold) | One `0` in field of `1`s | `gpio_put(row, 0)` for ON, `gpio_put(row, 1)` for OFF |
+| **Reversed (Janelia)** | HIGH (one-hot) | One `1` in field of `0`s | `gpio_set_mask64` for ON, `gpio_clr_mask64` for OFF |
 
 Again, trivially handled in software. No architectural impact.
 
