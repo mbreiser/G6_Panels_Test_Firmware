@@ -212,6 +212,9 @@ static float    bcm_base_on_us = 0.5f;                   // base time unit T (µ
 static uint8_t  pixel_data[PANEL_SIZE][PANEL_SIZE];       // intensity per pixel
 static uint32_t bcm_plane_data[PANEL_SIZE][8][2];         // [row][bit] = {pio_pattern, pio_delay}
 
+// External trigger state (Phase 6)
+static enum { TRIG_DWT, TRIG_EXT } trig_mode = TRIG_DWT;
+
 // RAMBURST state (Phase 5 — production simulation)
 // Test frames stored in PSRAM (not SRAM!) to avoid disrupting SRAM layout
 // of timing-critical code. SRAM layout sensitivity causes jitter regression.
@@ -219,6 +222,35 @@ static uint32_t bcm_plane_data[PANEL_SIZE][8][2];         // [row][bit] = {pio_p
 static uint8_t  (*test_frames)[PANEL_SIZE][PANEL_SIZE] = nullptr;  // allocated in PSRAM
 static uint8_t  n_test_frames = 0;
 static uint8_t  current_frame_idx = 0;
+
+// ── External trigger: wait for rising edge on GP45 or DWT simulated ──────
+// Returns false on timeout (EXT mode only). SRAM-resident for zero jitter.
+static bool __attribute__((noinline)) __not_in_flash_func(wait_for_trigger)(
+    uint32_t* trigger_start, uint32_t trigger_period_cyc)
+{
+    if (trig_mode == TRIG_EXT) {
+        // GP45 is in high GPIO bank: bit = EINT_PIN - 32 = 13
+        const uint32_t eint_mask = 1u << (EINT_PIN - 32);
+        uint32_t timeout = trigger_period_cyc * 4;  // 4× period timeout
+        uint32_t t0 = m33_hw->dwt_cyccnt;
+
+        // Wait for pin LOW (re-arm after previous trigger's HIGH phase)
+        while (sio_hw->gpio_hi_in & eint_mask) {
+            if ((m33_hw->dwt_cyccnt - t0) > timeout) return false;
+        }
+        // Wait for rising edge (LOW → HIGH)
+        while (!(sio_hw->gpio_hi_in & eint_mask)) {
+            if ((m33_hw->dwt_cyccnt - t0) > timeout) return false;
+        }
+        *trigger_start = m33_hw->dwt_cyccnt;
+        return true;
+    } else {
+        // DWT simulated trigger (existing behavior)
+        while ((m33_hw->dwt_cyccnt - *trigger_start) < trigger_period_cyc) {}
+        *trigger_start += trigger_period_cyc;
+        return true;
+    }
+}
 
 static void precompute_scan_masks() {
     // Row masks (schematic row pins)
@@ -1906,17 +1938,23 @@ static void __attribute__((noinline)) __not_in_flash_func(run_bcm_burst_pio)(
     interrupts();
     stats_reset();  // clear any stats from warm-up
 
-    // Full-loop noInterrupts for zero-jitter measurement
-    noInterrupts();
-
     // Main trigger loop
+    // DWT mode: full-loop noInterrupts for zero jitter
+    // EXT mode: per-burst noInterrupts (must release during idle for trigger wait)
     uint32_t trigger_start = m33_hw->dwt_cyccnt;
     uint8_t row = 0;
 
-    for (uint32_t t = 0; t < n_triggers; t++) {
-        while ((m33_hw->dwt_cyccnt - trigger_start) < trigger_period_cyc) {}
-        trigger_start += trigger_period_cyc;
+    if (trig_mode == TRIG_DWT) noInterrupts();
 
+    for (uint32_t t = 0; t < n_triggers; t++) {
+        if (!wait_for_trigger(&trigger_start, trigger_period_cyc)) {
+            if (trig_mode == TRIG_DWT) interrupts();
+            Serial.print("  TIMEOUT at trigger ");
+            Serial.println(t);
+            break;
+        }
+
+        if (trig_mode == TRIG_EXT) noInterrupts();
         uint32_t burst_start = m33_hw->dwt_cyccnt;
 
         gpio_set_mask64(row_on_mask[row]);
@@ -1929,14 +1967,22 @@ static void __attribute__((noinline)) __not_in_flash_func(run_bcm_burst_pio)(
         gpio_clr_mask64(row_on_mask[row]);
 
         uint32_t burst_end = m33_hw->dwt_cyccnt;
+        if (trig_mode == TRIG_EXT) interrupts();
 
         stats_update(burst_end - burst_start, 0);
 
         row++;
         if (row >= active_rows) row = 0;
+
+        if (trig_mode == TRIG_EXT && (t % 1000 == 999) && user_wants_stop()) {
+            Serial.print("  (interrupted at trigger ");
+            Serial.print(t + 1);
+            Serial.println(")");
+            break;
+        }
     }
 
-    interrupts();
+    if (trig_mode == TRIG_DWT) interrupts();
     multicore_lockout_end_blocking();
 
     pio_sm_set_enabled(pio_hw_inst, pio_sm_idx, false);
@@ -2526,8 +2572,7 @@ static void __attribute__((noinline)) __not_in_flash_func(run_bcm_visual_level)(
         pc_count++;
 
         // Wait for trigger, then disable interrupts for burst
-        while ((m33_hw->dwt_cyccnt - trigger_start) < trigger_period_cyc) {}
-        trigger_start += trigger_period_cyc;
+        if (!wait_for_trigger(&trigger_start, trigger_period_cyc)) break;
         noInterrupts();
 
         // --- BURST PHASE: one row, all bit-planes ---
@@ -2807,19 +2852,22 @@ static void __attribute__((noinline)) __not_in_flash_func(run_ramburst)(
             precompute_count++;
         }
 
-        if (preemptive_noint && guard_cyc > 0) {
+        if (trig_mode == TRIG_EXT) {
+            // External trigger: wait for rising edge, then disable interrupts
+            if (!wait_for_trigger(&trigger_start, trigger_period_cyc)) break;
+            noInterrupts();
+        } else if (preemptive_noint && guard_cyc > 0) {
             // Strategy A: enter noInterrupts EARLY, before trigger time
-            uint32_t guard_target = trigger_start + trigger_period_cyc - guard_cyc;
             while ((m33_hw->dwt_cyccnt - trigger_start) < (trigger_period_cyc - guard_cyc)) {}
             noInterrupts();
             // Now wait for actual trigger time
             while ((m33_hw->dwt_cyccnt - trigger_start) < trigger_period_cyc) {}
+            trigger_start += trigger_period_cyc;
         } else {
-            // Wait for trigger, then disable interrupts
-            while ((m33_hw->dwt_cyccnt - trigger_start) < trigger_period_cyc) {}
+            // Wait for DWT trigger, then disable interrupts
+            if (!wait_for_trigger(&trigger_start, trigger_period_cyc)) break;
             noInterrupts();
         }
-        trigger_start += trigger_period_cyc;
 
         // --- BURST PHASE: one row, all bit-planes ---
         uint32_t burst_start = m33_hw->dwt_cyccnt;
@@ -2950,6 +2998,248 @@ static void cmd_ramburst(const char* arg) {
     Serial.println("--- RAMBURST END ---");
 
     col_pins_to_sio();
+    stats_reset();
+    running = was_running;
+    if (running) count = 0;
+}
+
+// ── External Trigger Commands (Phase 6) ─────────────────────────────────
+
+static void cmd_exttrig(const char* arg) {
+    if (arg && *arg) {
+        if (strcmp(arg, "ON") == 0 || strcmp(arg, "EXT") == 0) {
+            trig_mode = TRIG_EXT;
+        } else if (strcmp(arg, "OFF") == 0 || strcmp(arg, "DWT") == 0) {
+            trig_mode = TRIG_DWT;
+        } else {
+            Serial.println("ERR: EXTTRIG ON|OFF");
+            return;
+        }
+    }
+    Serial.print("Trigger mode: ");
+    Serial.println(trig_mode == TRIG_EXT ? "EXTERNAL (GP45, rising edge)" : "DWT (simulated)");
+    if (trig_mode == TRIG_EXT) {
+        bool pin_state = (sio_hw->gpio_hi_in >> (EINT_PIN - 32)) & 1;
+        Serial.print("  GP45 state: ");
+        Serial.println(pin_state ? "HIGH" : "LOW");
+    }
+}
+
+static void cmd_trigtest(const char* arg) {
+    uint32_t n = 10;
+    if (arg && *arg) n = strtoul(arg, nullptr, 10);
+    if (n == 0 || n > 100000) n = 10;
+
+    const uint32_t eint_mask = 1u << (EINT_PIN - 32);
+    uint32_t timeout_cyc = cycles_per_us * 2000000;  // 2s timeout per edge
+
+    Serial.println("--- TRIGTEST START ---");
+    Serial.print("Waiting for ");
+    Serial.print(n);
+    Serial.println(" rising edges on GP45...");
+
+    uint32_t last_edge = 0;
+    float period_sum = 0;
+    uint32_t valid_periods = 0;
+
+    for (uint32_t i = 0; i < n; i++) {
+        uint32_t t0 = m33_hw->dwt_cyccnt;
+
+        // Wait for LOW (re-arm)
+        while (sio_hw->gpio_hi_in & eint_mask) {
+            if ((m33_hw->dwt_cyccnt - t0) > timeout_cyc) {
+                Serial.println("  TIMEOUT waiting for LOW");
+                goto done;
+            }
+            if (Serial.available()) { while (Serial.available()) Serial.read(); goto done; }
+        }
+        // Wait for rising edge
+        while (!(sio_hw->gpio_hi_in & eint_mask)) {
+            if ((m33_hw->dwt_cyccnt - t0) > timeout_cyc) {
+                Serial.println("  TIMEOUT waiting for rising edge");
+                goto done;
+            }
+            if (Serial.available()) { while (Serial.available()) Serial.read(); goto done; }
+        }
+
+        uint32_t now = m33_hw->dwt_cyccnt;
+        if (i > 0) {
+            float period_us = cycles_to_us(now - last_edge);
+            float freq_hz = 1000000.0f / period_us;
+            period_sum += period_us;
+            valid_periods++;
+            if (i < 10 || (i % (n / 10) == 0) || i == n - 1) {
+                Serial.print("  Edge ");
+                Serial.print(i);
+                Serial.print("  period=");
+                Serial.print(period_us, 1);
+                Serial.print("us  freq=");
+                Serial.print(freq_hz, 1);
+                Serial.println("Hz");
+            }
+        }
+        last_edge = now;
+    }
+done:
+    if (valid_periods > 0) {
+        float mean_period = period_sum / valid_periods;
+        float mean_freq = 1000000.0f / mean_period;
+        Serial.print("  Mean period=");
+        Serial.print(mean_period, 1);
+        Serial.print("us  freq=");
+        Serial.print(mean_freq, 1);
+        Serial.print("Hz  (");
+        Serial.print(valid_periods);
+        Serial.println(" intervals)");
+    }
+    Serial.println("--- TRIGTEST END ---");
+}
+
+static void cmd_photocal(const char* arg) {
+    float hold_sec = 3.0f;
+    if (arg && *arg) hold_sec = strtof(arg, nullptr);
+    if (hold_sec < 0.5f || hold_sec > 60.0f) hold_sec = 3.0f;
+
+    if (!pio_loaded && !pio_init_program()) return;
+
+    bool was_running = running;
+    running = false;
+    all_off();
+    col_pins_to_pio();
+    precompute_scan_masks();
+
+    float rate = 8000.0f;
+    uint32_t triggers_per_level = (uint32_t)(hold_sec * rate);
+    uint32_t trigger_period_cyc = (uint32_t)(cycles_per_us * 1000000.0f / rate);
+
+    // Drain serial buffer
+    delay(50);
+    while (Serial.available()) Serial.read();
+
+    Serial.println("--- PHOTOCAL START ---");
+    Serial.print("BCM bits=");
+    Serial.print(bcm_bits);
+    Serial.print("  T=");
+    Serial.print(bcm_base_on_us, 3);
+    Serial.print("us  Hold=");
+    Serial.print(hold_sec, 1);
+    Serial.print("s  Rate=");
+    Serial.print(rate, 0);
+    Serial.print("Hz  Trig=");
+    Serial.println(trig_mode == TRIG_EXT ? "EXT" : "DWT");
+    Serial.println("level,burst_min_us,burst_max_us,burst_mean_us,jitter_us,outliers,triggers");
+
+    // Setup PIO SM
+    pio_sm_set_enabled(pio_hw_inst, pio_sm_idx, false);
+    pio_sm_clear_fifos(pio_hw_inst, pio_sm_idx);
+    pio_sm_restart(pio_hw_inst, pio_sm_idx);
+    pio_sm_set_consecutive_pindirs(pio_hw_inst, pio_sm_idx, COL_PIN[0], PANEL_SIZE, true);
+    pio_sm_exec(pio_hw_inst, pio_sm_idx, pio_encode_jmp(pio_offset));
+    pio_interrupt_clear(pio_hw_inst, 0);
+    pio_sm_set_enabled(pio_hw_inst, pio_sm_idx, true);
+    pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, 0xFFFFF);
+
+    // Compute outlier threshold
+    uint32_t base_cycles = (uint32_t)(bcm_base_on_us * cycles_per_us);
+    uint32_t nominal_burst_cyc = 0;
+    for (int b = 0; b < bcm_bits; b++) {
+        nominal_burst_cyc += base_cycles * (1U << b) + PIO_ON_OVERHEAD_CYCLES + 50;
+    }
+
+    for (int level = 0; level < (1 << bcm_bits); level++) {
+        // Set all pixels to this intensity
+        memset(pixel_data, level, sizeof(pixel_data));
+        precompute_bcm_data();
+
+        stats_reset();
+        stat_outlier_threshold = nominal_burst_cyc * 2;
+
+        // Warm-up: 100 triggers on DWT regardless of mode
+        uint32_t warmup_start = m33_hw->dwt_cyccnt;
+        uint8_t warmup_row = 0;
+        noInterrupts();
+        for (int w = 0; w < 100; w++) {
+            while ((m33_hw->dwt_cyccnt - warmup_start) < trigger_period_cyc) {}
+            warmup_start += trigger_period_cyc;
+            gpio_set_mask64(row_on_mask[warmup_row]);
+            for (int b = 0; b < bcm_bits; b++) {
+                pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, bcm_plane_data[warmup_row][b][0]);
+                pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, bcm_plane_data[warmup_row][b][1]);
+                while (!pio_interrupt_get(pio_hw_inst, 0)) {}
+                pio_interrupt_clear(pio_hw_inst, 0);
+            }
+            gpio_clr_mask64(row_on_mask[warmup_row]);
+            warmup_row++;
+            if (warmup_row >= active_rows) warmup_row = 0;
+        }
+        interrupts();
+
+        // Main measurement loop — per-burst noInterrupts
+        uint32_t trigger_start = m33_hw->dwt_cyccnt;
+        uint8_t row = 0;
+        bool timeout = false;
+
+        for (uint32_t t = 0; t < triggers_per_level; t++) {
+            if (!wait_for_trigger(&trigger_start, trigger_period_cyc)) {
+                Serial.print("  TIMEOUT at level ");
+                Serial.print(level);
+                Serial.print(" trigger ");
+                Serial.println(t);
+                timeout = true;
+                break;
+            }
+
+            noInterrupts();
+            uint32_t burst_start = m33_hw->dwt_cyccnt;
+            gpio_set_mask64(row_on_mask[row]);
+            for (int b = 0; b < bcm_bits; b++) {
+                pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, bcm_plane_data[row][b][0]);
+                pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, bcm_plane_data[row][b][1]);
+                while (!pio_interrupt_get(pio_hw_inst, 0)) {}
+                pio_interrupt_clear(pio_hw_inst, 0);
+            }
+            gpio_clr_mask64(row_on_mask[row]);
+            uint32_t burst_end = m33_hw->dwt_cyccnt;
+            interrupts();
+
+            stats_update(burst_end - burst_start, 0);
+            row++;
+            if (row >= active_rows) row = 0;
+
+            if ((t % 1000 == 999) && user_wants_stop()) {
+                Serial.print("  (interrupted at trigger ");
+                Serial.print(t + 1);
+                Serial.println(")");
+                break;
+            }
+        }
+
+        // Print stats for this level
+        Serial.print(level);
+        Serial.print(",");
+        if (stat_count > 0) {
+            Serial.print(cycles_to_us(stat_on_min), 3);
+            Serial.print(",");
+            Serial.print(cycles_to_us(stat_on_max), 3);
+            Serial.print(",");
+            Serial.print(cycles_to_us((uint32_t)(stat_on_sum / stat_count)), 3);
+            Serial.print(",");
+            Serial.print(cycles_to_us(stat_on_max - stat_on_min), 3);
+            Serial.print(",");
+            Serial.print(stat_outlier_count);
+            Serial.print(",");
+            Serial.println(stat_count);
+        } else {
+            Serial.println("0,0,0,0,0,0");
+        }
+
+        if (timeout) break;
+    }
+
+    Serial.println("--- PHOTOCAL END ---");
+
+    col_pins_to_sio();
+    all_off();
     stats_reset();
     running = was_running;
     if (running) count = 0;
@@ -3324,6 +3614,10 @@ static void cmd_help() {
     Serial.println("                 A=PIO, B=DMA, C=MSM (default A, 8000 Hz)");
     Serial.println("BCMDEMO          Ramp 0→max intensity, 1s/step, timing data");
     Serial.println("BCMVISUAL [sec]  Visual test: 4 levels x sec (SRAM reload @ 400Hz)");
+    Serial.println("== External Trigger (Phase 6) ==");
+    Serial.println("EXTTRIG ON|OFF   Switch external (GP45 rising edge) / simulated (DWT)");
+    Serial.println("TRIGTEST [N]     Count N rising edges on GP45, report period/freq");
+    Serial.println("PHOTOCAL [sec]   Cycle all 16 BCM levels, sec each, timing stats");
     Serial.println("REBOOT           Reboot into BOOTSEL (USB flash) mode");
     Serial.println("HELP             This message");
 }
@@ -3959,6 +4253,12 @@ static void process_command() {
         cmd_bcmvisual(args);
     } else if (strcmp(cmd_buf, "RAMBURST") == 0) {
         cmd_ramburst(args);
+    } else if (strcmp(cmd_buf, "EXTTRIG") == 0) {
+        cmd_exttrig(args);
+    } else if (strcmp(cmd_buf, "TRIGTEST") == 0) {
+        cmd_trigtest(args);
+    } else if (strcmp(cmd_buf, "PHOTOCAL") == 0) {
+        cmd_photocal(args);
     } else if (strcmp(cmd_buf, "REBOOT") == 0) {
         Serial.println("Rebooting into BOOTSEL mode...");
         Serial.flush();
@@ -4033,6 +4333,12 @@ void setup() {
     }
     gpio_set_dir_out_masked64(ROW_PIN_mask);
     gpio_clr_mask64(ROW_PIN_mask);  // all rows LOW (OFF)
+
+    // External trigger input (GP45 bodge wire)
+    gpio_init(EINT_PIN);
+    gpio_set_dir(EINT_PIN, GPIO_IN);
+    gpio_pull_down(EINT_PIN);  // default LOW when no signal connected
+
     Serial.println("GPIO OK");
 
     // Pre-compute masks

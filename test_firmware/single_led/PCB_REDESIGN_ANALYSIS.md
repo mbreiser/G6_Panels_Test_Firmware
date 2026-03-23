@@ -1,4 +1,4 @@
-# G6 Panel PCB Redesign Analysis
+- [ ] # G6 Panel PCB Redesign Analysis
 
 ## Document Purpose
 
@@ -10,18 +10,18 @@ This document analyzes the current G6 panel PCB pin assignments, evaluates how t
 
 ### 1.1 Pin Assignments (Current Board)
 
-| GPIO | Function | Notes |
-|------|----------|-------|
-| GP0 | XIP_CS1n | PSRAM chip select (RP2354). **Cannot be repurposed.** |
-| GP1-GP20 | Column pins (COL_MCU_00–19) | 20 contiguous pins. Drive LED columns via UCC27517 gate drivers. |
-| GP21-GP31 | Row pins (ROW_MCU_00–10) | First 11 of 20 row pins. |
-| GP32 | SPI0_TX (MOSI) | Hardware SPI0 slave — receives frame data from arena controller. |
-| GP33 | SPI0_CSn (CS) | Hardware SPI0 chip select. |
-| GP34 | SPI0_SCK (SCK) | Hardware SPI0 clock (25–30 MHz). |
-| GP35 | SPI0_RX (MISO) | Hardware SPI0 data out (slave → master). |
-| GP36-GP44 | Row pins (ROW_MCU_11–19) | Remaining 9 of 20 row pins. |
-| GP45-GP47 | Unconnected | Not routed to any MCU function. |
-| EINT | External interrupt | On header connectors J3-1 and J5-1. **Not routed to any MCU GPIO.** |
+| GPIO      | Function                    | Notes                                                               |
+| --------- | --------------------------- | ------------------------------------------------------------------- |
+| GP0       | XIP_CS1n                    | PSRAM chip select (RP2354). **Cannot be repurposed.**               |
+| GP1-GP20  | Column pins (COL_MCU_00–19) | 20 contiguous pins. Drive LED columns via UCC27517 gate drivers.    |
+| GP21-GP31 | Row pins (ROW_MCU_00–10)    | First 11 of 20 row pins.                                            |
+| GP32      | SPI0_TX (MOSI)              | Hardware SPI0 slave — receives frame data from arena controller.    |
+| GP33      | SPI0_CSn (CS)               | Hardware SPI0 chip select.                                          |
+| GP34      | SPI0_SCK (SCK)              | Hardware SPI0 clock (25–30 MHz).                                    |
+| GP35      | SPI0_RX (MISO)              | Hardware SPI0 data out (slave → master).                            |
+| GP36-GP44 | Row pins (ROW_MCU_11–19)    | Remaining 9 of 20 row pins.                                         |
+| GP45-GP47 | Unconnected                 | Not routed to any MCU function.                                     |
+| EINT      | External interrupt          | On header connectors J3-1 and J5-1. **Not routed to any MCU GPIO.** |
 
 ### 1.2 Pin Map Diagram
 
@@ -83,10 +83,10 @@ The G6 panels exist in two LED polarity configurations:
 
 ### 2.2 Impact on PIO Column Driving
 
-| Polarity | PIO pattern for "pixel ON" | All-OFF state | PIO program |
-|----------|---------------------------|---------------|-------------|
-| Normal (iorodeo) | Bit = 1 (HIGH) | `0x00000` | `out pins, 20` directly |
-| **Reversed (Janelia batch)** | Bit = 0 (LOW) | `0xFFFFF` | Invert in software before push, or use `mov pins, ~osr` in PIO |
+| Polarity                     | PIO pattern for "pixel ON" | All-OFF state | PIO program                                                    |
+| ---------------------------- | -------------------------- | ------------- | -------------------------------------------------------------- |
+| Normal (iorodeo)             | Bit = 1 (HIGH)             | `0x00000`     | `out pins, 20` directly                                        |
+| **Reversed (Janelia batch)** | Bit = 0 (LOW)              | `0xFFFFF`     | Invert in software before push, or use `mov pins, ~osr` in PIO |
 
 **Conclusion: LED polarity is a trivial software concern** for the PIO column pattern — one XOR or one PIO instruction handles either convention. It does not constrain pin assignment or PIO architecture.
 
@@ -94,10 +94,10 @@ The G6 panels exist in two LED polarity configurations:
 
 In a passive LED matrix, the anode side must **source** current and the cathode side must **sink** current. The active row carries the aggregated current of all lit columns (up to 20× a single LED's current), so the row driver must handle higher peak current regardless of polarity.
 
-| Polarity | Column role | Row role | Row peak current |
-|----------|-----------|---------|-----------------|
-| Normal (iorodeo) | Source (HIGH = ON) | Sink (LOW = ON) | Up to 20× I_LED (sinking) |
-| **Reversed (Janelia)** | Sink (LOW = ON) | Source (HIGH = ON) | Up to 20× I_LED (sourcing) |
+| Polarity               | Column role        | Row role           | Row peak current           |
+| ---------------------- | ------------------ | ------------------ | -------------------------- |
+| Normal (iorodeo)       | Source (HIGH = ON) | Sink (LOW = ON)    | Up to 20× I_LED (sinking)  |
+| **Reversed (Janelia)** | Sink (LOW = ON)    | Source (HIGH = ON) | Up to 20× I_LED (sourcing) |
 
 **Hardware impact**: The UCC27517 gate driver is a push-pull output stage that can both source and sink current. However, its source and sink resistance differ slightly (datasheet: R_OH vs R_OL). This means brightness may vary slightly between the two polarity conventions for the same drive conditions, though the effect should be small given the UCC27517's low output impedance in both directions.
 
@@ -107,10 +107,10 @@ In a passive LED matrix, the anode side must **source** current and the cathode 
 
 For rows, only one row is active at a time:
 
-| Polarity | Active row signal | PIO pattern | CPU alternative |
-|----------|------------------|-------------|-----------------|
-| Normal (iorodeo) | LOW (one-cold) | One `0` in field of `1`s | `gpio_put(row, 0)` for ON, `gpio_put(row, 1)` for OFF |
-| **Reversed (Janelia)** | HIGH (one-hot) | One `1` in field of `0`s | `gpio_set_mask64` for ON, `gpio_clr_mask64` for OFF |
+| Polarity               | Active row signal | PIO pattern              | CPU alternative                                       |
+| ---------------------- | ----------------- | ------------------------ | ----------------------------------------------------- |
+| Normal (iorodeo)       | LOW (one-cold)    | One `0` in field of `1`s | `gpio_put(row, 0)` for ON, `gpio_put(row, 1)` for OFF |
+| **Reversed (Janelia)** | HIGH (one-hot)    | One `1` in field of `0`s | `gpio_set_mask64` for ON, `gpio_clr_mask64` for OFF   |
 
 Trivially handled in software. No architectural impact.
 
@@ -158,10 +158,10 @@ PIO1 `out pins, 24` starting at GP21 writes bits 5-28 of PIO1's output register 
 
 SPI peripherals can only be mapped to specific GPIO groups (funcsel repeats every 8 pins):
 
-| Peripheral | Pin Groups |
-|------------|------------|
-| **SPI0** | GP0-3, GP4-7, GP16-19, GP20-23, **GP32-35**, GP36-39 |
-| **SPI1** | GP8-11, GP12-15, GP24-27, GP28-31, GP40-43, **GP44-47** |
+| Peripheral | Pin Groups                                              |
+| ---------- | ------------------------------------------------------- |
+| **SPI0**   | GP0-3, GP4-7, GP16-19, GP20-23, **GP32-35**, GP36-39    |
+| **SPI1**   | GP8-11, GP12-15, GP24-27, GP28-31, GP40-43, **GP44-47** |
 
 ---
 
@@ -181,14 +181,14 @@ GP45        EINT (bodge wire from header J3-1 or J5-1)
 GP46-47     Spare
 ```
 
-| Aspect | Assessment |
-|--------|------------|
-| Columns | ✅ Contiguous (GP1-20), PIO0 `out pins, 20` |
-| Rows | ⚠️ Split (GP21-31 + GP36-44), CPU `gpio_mask64` only |
-| SPI | ✅ Hardware SPI0 on GP32-35 |
-| EINT | ✅ Routed to GP45 (hand-wired) |
-| PIO row driving | ⚠️ Possible but writes through SPI pins (fragile) |
-| Effort | Trivial — one wire, no PCB fab |
+| Aspect          | Assessment                                           |
+| --------------- | ---------------------------------------------------- |
+| Columns         | ✅ Contiguous (GP1-20), PIO0 `out pins, 20`          |
+| Rows            | ⚠️ Split (GP21-31 + GP36-44), CPU `gpio_mask64` only |
+| SPI             | ✅ Hardware SPI0 on GP32-35                          |
+| EINT            | ✅ Routed to GP45 (hand-wired)                       |
+| PIO row driving | ⚠️ Possible but writes through SPI pins (fragile)    |
+| Effort          | Trivial — one wire, no PCB fab                       |
 
 **Best for**: Immediate testing on current boards. Gets EINT working with zero risk.
 
@@ -207,24 +207,24 @@ GP46        Sync output (active during scan burst) ← NEW: optional header
 GP47        Debug / spare                 ← NEW: optional header
 ```
 
-| Aspect | Assessment |
-|--------|------------|
-| Columns | ✅ Contiguous (GP1-20), PIO0 `out pins, 20` |
-| Rows | ⚠️ Split (GP21-31 + GP36-44), same as current |
-| SPI | ✅ Hardware SPI0 on GP32-35 (unchanged) |
-| EINT | ✅ GP45, proper PCB trace |
-| PIO row driving | ⚠️ Same limitation as current (writes through SPI pins) |
-| Arena controller | No change needed |
-| Firmware | No SPI changes needed — just add trigger input code |
-| Effort | **Minimal** — add 1 trace + optional headers. No rerouting. |
+| Aspect           | Assessment                                                  |
+| ---------------- | ----------------------------------------------------------- |
+| Columns          | ✅ Contiguous (GP1-20), PIO0 `out pins, 20`                 |
+| Rows             | ⚠️ Split (GP21-31 + GP36-44), same as current               |
+| SPI              | ✅ Hardware SPI0 on GP32-35 (unchanged)                     |
+| EINT             | ✅ GP45, proper PCB trace                                   |
+| PIO row driving  | ⚠️ Same limitation as current (writes through SPI pins)     |
+| Arena controller | No change needed                                            |
+| Firmware         | No SPI changes needed — just add trigger input code         |
+| Effort           | **Minimal** — add 1 trace + optional headers. No rerouting. |
 
 **Recommended spare pin usage (GP45-47):**
 
-| Pin | Recommended Function | Rationale |
-|-----|---------------------|-----------|
-| **GP45** | **EINT (external trigger input)** | Primary need. Microscope trigger for 2P sync. Visible to PIO1 (GPIOBASE=16 covers GP16-47) for `wait pin` trigger. Also readable as CPU GPIO for polling. |
+| Pin      | Recommended Function                | Rationale                                                                                                                                                                                                                                                       |
+| -------- | ----------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **GP45** | **EINT (external trigger input)**   | Primary need. Microscope trigger for 2P sync. Visible to PIO1 (GPIOBASE=16 covers GP16-47) for `wait pin` trigger. Also readable as CPU GPIO for polling.                                                                                                       |
 | **GP46** | **Sync output (scan burst active)** | Drive HIGH during the ~10 µs scan burst, LOW during idle. Enables oscilloscope triggering to verify timing, measure actual jitter with external instruments, and confirm synchronization with microscope scan. Invaluable for system integration and debugging. |
-| **GP47** | **Frame-sync output or spare** | Pulse once per complete frame (every 20 triggers = every 2.5 ms at 400 Hz). Useful for verifying frame rate, triggering frame-synchronized data acquisition, or as a general-purpose debug/test point. |
+| **GP47** | **Frame-sync output or spare**      | Pulse once per complete frame (every 20 triggers = every 2.5 ms at 400 Hz). Useful for verifying frame rate, triggering frame-synchronized data acquisition, or as a general-purpose debug/test point.                                                          |
 
 All three pins are in PIO1's range (GPIOBASE=16 covers GP16-47), so they can be driven by PIO state machines if needed, or used as simple CPU GPIO.
 
@@ -247,17 +247,17 @@ GP46        SPI1_SCK (SCK)
 GP47        SPI1_TX (MOSI)
 ```
 
-| Aspect | Assessment |
-|--------|------------|
-| Columns | ✅ Contiguous (GP1-20), PIO0 `out pins, 20` |
-| Rows | ✅ Contiguous (GP21-40), PIO1 `out pins, 20` — clean, no gap |
-| SPI | ✅ Hardware SPI1 on GP44-47 (identical capability to SPI0) |
-| EINT | ✅ GP41, visible to PIO1 for `wait pin` and CPU for GPIO read |
-| PIO row driving | ✅ Clean — no SPI pins in the output range |
-| Spare pins | GP42-43 for sync output and debug |
-| Firmware change | One line: `spi_init(spi0, ...)` → `spi_init(spi1, ...)` + pin constants |
-| Arena controller change | Re-wire SPI header to new pin positions |
-| Effort | Full PCB re-route + firmware update on both panel and controller |
+| Aspect                  | Assessment                                                              |
+| ----------------------- | ----------------------------------------------------------------------- |
+| Columns                 | ✅ Contiguous (GP1-20), PIO0 `out pins, 20`                             |
+| Rows                    | ✅ Contiguous (GP21-40), PIO1 `out pins, 20` — clean, no gap            |
+| SPI                     | ✅ Hardware SPI1 on GP44-47 (identical capability to SPI0)              |
+| EINT                    | ✅ GP41, visible to PIO1 for `wait pin` and CPU for GPIO read           |
+| PIO row driving         | ✅ Clean — no SPI pins in the output range                              |
+| Spare pins              | GP42-43 for sync output and debug                                       |
+| Firmware change         | One line: `spi_init(spi0, ...)` → `spi_init(spi1, ...)` + pin constants |
+| Arena controller change | Re-wire SPI header to new pin positions                                 |
+| Effort                  | Full PCB re-route + firmware update on both panel and controller        |
 
 **PIO coverage verification:**
 ```
@@ -289,14 +289,14 @@ GP45        SPI CS                        → PIO0 or PIO1 SM
 GP46-47     Spare
 ```
 
-| Aspect | Assessment |
-|--------|------------|
-| Columns | ✅ Contiguous (GP1-20), PIO0 |
-| Rows | ✅ Contiguous (GP21-40), PIO1 |
-| SPI | ⚠️ PIO-based slave (consumes 1 SM, more complex, needs validation) |
-| EINT | ✅ GP41 |
-| Spare | GP46-47 (more free pins) |
-| Effort | PCB re-route + new PIO SPI slave program + validation |
+| Aspect  | Assessment                                                         |
+| ------- | ------------------------------------------------------------------ |
+| Columns | ✅ Contiguous (GP1-20), PIO0                                       |
+| Rows    | ✅ Contiguous (GP21-40), PIO1                                      |
+| SPI     | ⚠️ PIO-based slave (consumes 1 SM, more complex, needs validation) |
+| EINT    | ✅ GP41                                                            |
+| Spare   | GP46-47 (more free pins)                                           |
+| Effort  | PCB re-route + new PIO SPI slave program + validation              |
 
 **Tradeoffs vs Option C:**
 - **Pro**: SPI pin placement is fully flexible (any GPIO), frees GP32-35 for other uses
@@ -310,16 +310,16 @@ GP46-47     Spare
 
 ## 4.5 Option Comparison Summary
 
-| | Option A | Option B | Option C | Option D |
-|---|---|---|---|---|
-| **Change** | Bodge wire | Add EINT trace | Full re-route | Full re-route + PIO SPI |
-| **EINT routed** | ✅ (wire) | ✅ (trace) | ✅ (trace) | ✅ (trace) |
-| **Contiguous rows** | ✗ | ✗ | ✅ | ✅ |
-| **Hardware SPI** | ✅ SPI0 | ✅ SPI0 | ✅ SPI1 | ✗ PIO |
-| **Spare pins** | GP46-47 | GP46-47 | GP42-43 | GP46-47 |
-| **Arena controller change** | None | None | SPI rewire | SPI rewire |
-| **PCB effort** | None | Minimal | Full re-route | Full re-route |
-| **Risk** | None | Very low | Medium | High |
+|                             | Option A   | Option B       | Option C      | Option D                |
+| --------------------------- | ---------- | -------------- | ------------- | ----------------------- |
+| **Change**                  | Bodge wire | Add EINT trace | Full re-route | Full re-route + PIO SPI |
+| **EINT routed**             | ✅ (wire)  | ✅ (trace)     | ✅ (trace)    | ✅ (trace)              |
+| **Contiguous rows**         | ✗          | ✗              | ✅            | ✅                      |
+| **Hardware SPI**            | ✅ SPI0    | ✅ SPI0        | ✅ SPI1       | ✗ PIO                   |
+| **Spare pins**              | GP46-47    | GP46-47        | GP42-43       | GP46-47                 |
+| **Arena controller change** | None       | None           | SPI rewire    | SPI rewire              |
+| **PCB effort**              | None       | Minimal        | Full re-route | Full re-route           |
+| **Risk**                    | None       | Very low       | Medium        | High                    |
 
 **Recommendation**: **Option B for the next PCB revision** (minimal change, maximum practical benefit). Option C only if a major board revision is already planned for other reasons.
 
@@ -329,20 +329,20 @@ GP46-47     Spare
 
 Understanding the baseline helps evaluate what the redesign enables.
 
-| Aspect | iorodeo production firmware | Our test firmware (Mode A) |
-|--------|---------------------------|---------------------------|
-| **Column drive** | CPU `digitalWrite()` per column (slow) | PIO0 `out pins, 20` (single-cycle) |
-| **Row drive** | CPU `gpio_put()` per row | CPU `gpio_set_mask64()` / `gpio_clr_mask64()` |
-| **PIO usage** | None | PIO0 for columns |
-| **Grayscale** | Linear PWM (equal-duration slots) | Binary-weighted BCM (4-bit, 16 levels) |
-| **Timing** | Busy-wait delay loops (uncalibrated) | DWT cycle-counter (sub-µs precision) |
-| **Jitter control** | None | Multicore lockout + noInterrupts + noinline + warm-up |
-| **Scan trigger** | On SPI message arrival (async) | 8 kHz DWT-simulated trigger (phase-locked) |
-| **Refresh** | Single-shot per SPI frame | Continuous 400 Hz |
-| **SPI handling** | Core 0 (hardware SPI0 slave) | N/A (USB serial for testing) |
-| **Display scanning** | Core 1 | Core 0 |
-| **Frame data** | Inter-core queue (Core 0 → Core 1) | RAM buffer with precomputed BCM planes |
-| **Coordinate mapping** | `sch_to_pos_index()` with NUM_COLOR=4 | Same mapping in `utilities.cpp` |
+| Aspect                 | iorodeo production firmware            | Our test firmware (Mode A)                            |
+| ---------------------- | -------------------------------------- | ----------------------------------------------------- |
+| **Column drive**       | CPU `digitalWrite()` per column (slow) | PIO0 `out pins, 20` (single-cycle)                    |
+| **Row drive**          | CPU `gpio_put()` per row               | CPU `gpio_set_mask64()` / `gpio_clr_mask64()`         |
+| **PIO usage**          | None                                   | PIO0 for columns                                      |
+| **Grayscale**          | Linear PWM (equal-duration slots)      | Binary-weighted BCM (4-bit, 16 levels)                |
+| **Timing**             | Busy-wait delay loops (uncalibrated)   | DWT cycle-counter (sub-µs precision)                  |
+| **Jitter control**     | None                                   | Multicore lockout + noInterrupts + noinline + warm-up |
+| **Scan trigger**       | On SPI message arrival (async)         | 8 kHz DWT-simulated trigger (phase-locked)            |
+| **Refresh**            | Single-shot per SPI frame              | Continuous 400 Hz                                     |
+| **SPI handling**       | Core 0 (hardware SPI0 slave)           | N/A (USB serial for testing)                          |
+| **Display scanning**   | Core 1                                 | Core 0                                                |
+| **Frame data**         | Inter-core queue (Core 0 → Core 1)     | RAM buffer with precomputed BCM planes                |
+| **Coordinate mapping** | `sch_to_pos_index()` with NUM_COLOR=4  | Same mapping in `utilities.cpp`                       |
 
 ### Key Improvement: BCM Efficiency
 
@@ -409,10 +409,10 @@ Our firmware uses **binary-coded modulation** (4 bit-plane passes for 16 gray le
 
 ### 6.3 Dual-Core Strategy
 
-| Core | Role | Interrupts | Notes |
-|------|------|-----------|-------|
-| **Core 0** | Scan loop + SPI | `noInterrupts()` during burst only | Handles trigger wait, BCM burst, and SPI between triggers |
-| **Core 1** | Locked out (or available for future use) | N/A | `multicore_lockout_start_blocking()` at startup. Could be unlocked for compute tasks if needed. |
+| Core       | Role                                     | Interrupts                         | Notes                                                                                           |
+| ---------- | ---------------------------------------- | ---------------------------------- | ----------------------------------------------------------------------------------------------- |
+| **Core 0** | Scan loop + SPI                          | `noInterrupts()` during burst only | Handles trigger wait, BCM burst, and SPI between triggers                                       |
+| **Core 1** | Locked out (or available for future use) | N/A                                | `multicore_lockout_start_blocking()` at startup. Could be unlocked for compute tasks if needed. |
 
 **Why Core 0 handles both scanning and SPI**: In the iorodeo firmware, Core 0 does SPI and Core 1 does display. But our zero-jitter architecture requires `noInterrupts()` during the burst, which is simpler on a single core. SPI reception happens during the 115 µs idle window when interrupts are enabled.
 
@@ -426,23 +426,23 @@ All measurements from our test firmware on current hardware (GP32-35 gap present
 
 640,000 measurements: 4 T values × 16 intensities × 10,000 frames at 8 kHz.
 
-| T (µs) | Burst min (µs) | Burst max (µs) | Jitter (µs) | Outliers | Fits 15 µs? |
-|---------|----------------|----------------|-------------|----------|-------------|
-| 0.25 | 5.727 | 5.727 | **0.000** | 0/160k | YES |
-| 0.50 | 9.433 | 9.433 | **0.000** | 0/160k | YES |
-| 0.75 | 13.227 | 13.227 | **0.000** | 0/160k | YES (barely) |
-| 1.00 | 16.960 | 16.960 | **0.000** | 0/160k | NO |
+| T (µs) | Burst min (µs) | Burst max (µs) | Jitter (µs) | Outliers | Fits 15 µs?  |
+| ------ | -------------- | -------------- | ----------- | -------- | ------------ |
+| 0.25   | 5.727          | 5.727          | **0.000**   | 0/160k   | YES          |
+| 0.50   | 9.433          | 9.433          | **0.000**   | 0/160k   | YES          |
+| 0.75   | 13.227         | 13.227         | **0.000**   | 0/160k   | YES (barely) |
+| 1.00   | 16.960         | 16.960         | **0.000**   | 0/160k   | NO           |
 
 ### 7.2 Recommended Operating Point
 
-| Parameter | Value |
-|-----------|-------|
-| BCM bits | 4 (16 intensity levels) |
-| Base T | 0.50 µs |
-| Burst time | 9.43 µs (deterministic) |
-| Budget margin | 5.6 µs (of 15 µs scan window) |
-| Frame rate | 400 Hz (8000 Hz trigger / 20 rows) |
-| Jitter | 0.000 µs |
+| Parameter     | Value                              |
+| ------------- | ---------------------------------- |
+| BCM bits      | 4 (16 intensity levels)            |
+| Base T        | 0.50 µs                            |
+| Burst time    | 9.43 µs (deterministic)            |
+| Budget margin | 5.6 µs (of 15 µs scan window)      |
+| Frame rate    | 400 Hz (8000 Hz trigger / 20 rows) |
+| Jitter        | 0.000 µs                           |
 
 ### 7.3 Zero-Jitter Recipe (All Required)
 
@@ -459,13 +459,13 @@ With all four: **0.000 µs jitter** across 640,000 measurements.
 
 These modes were evaluated for full-panel scanning before BCM was added:
 
-| Mode | Description | Row Overhead | Jitter (ON=0.25µs) | noInterrupts compatible? |
-|------|-------------|-------------|---------------------|--------------------------|
-| SCAN | CPU drives both rows and columns | 0.76 µs | ~5 µs | Yes |
-| PIOSCAN | PIO0 columns + CPU rows (polling) | 0.61 µs | 1.69 µs | Yes |
-| DMASCAN | DMA feeds PIO0 + ISR row switch | 0.57 µs | 5.23 µs | No (needs ISR) |
-| MSMSCAN | Dual PIO (PIO0 cols + PIO1 rows) + bridge ISR | 0.37 µs | 11.77 µs | No (needs ISR) |
-| BURST | PIOSCAN with simulated 8 kHz trigger | 0.61 µs | 0.00 µs | Yes |
+| Mode    | Description                                   | Row Overhead | Jitter (ON=0.25µs) | noInterrupts compatible? |
+| ------- | --------------------------------------------- | ------------ | ------------------ | ------------------------ |
+| SCAN    | CPU drives both rows and columns              | 0.76 µs      | ~5 µs              | Yes                      |
+| PIOSCAN | PIO0 columns + CPU rows (polling)             | 0.61 µs      | 1.69 µs            | Yes                      |
+| DMASCAN | DMA feeds PIO0 + ISR row switch               | 0.57 µs      | 5.23 µs            | No (needs ISR)           |
+| MSMSCAN | Dual PIO (PIO0 cols + PIO1 rows) + bridge ISR | 0.37 µs      | 11.77 µs           | No (needs ISR)           |
+| BURST   | PIOSCAN with simulated 8 kHz trigger          | 0.61 µs      | 0.00 µs            | Yes                      |
 
 **Key insight**: MSMSCAN has the lowest overhead (0.37 µs) but the worst jitter because it requires bridge ISRs. For 2P sync, PIOSCAN (Mode A) is the only viable architecture — it's `noInterrupts()` compatible, giving zero jitter.
 
