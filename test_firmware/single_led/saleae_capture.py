@@ -1,82 +1,62 @@
 #!/usr/bin/env python3
 """
-Saleae Logic 2 automation for G6 panel timing verification.
-
-Captures digital timing (trigger, row, column pins) and optionally analog
-(photodiode) signals. Provides automated capture + analysis pipeline.
+Saleae Logic 2 automation for G6 panel timing + photodiode characterization.
 
 Requires:
-    pip install logic2-automation
-    Logic 2 desktop app running with automation server enabled (port 10430)
+  - pip install logic2-automation
+  - Logic 2 desktop app running with automation server enabled (port 10430)
+  - Saleae Logic Pro 8 connected
 
-Channels (configured for current bodge-wire setup, GP46/47 not available):
-    D0 = GP45 (EINT trigger input)
-    D1 = GP1  (column 0 — LED timing, BCM bit-plane pattern)
-    D2 = GP21 (row 0 — row activation, burst timing)
-    D3 = GP2  (column 1 — optional cross-check)
-    A0 = Photodiode (optional analog, for linearity characterization)
+Channel setup:
+  Ch 0 (Digital): GP45 — external trigger input (8 kHz from function generator)
+  Ch 1 (Analog):  Photodiode output — LED brightness measurement
 
 Usage:
-    # Automated capture during BCMBURST:
-    python3 saleae_capture.py bcmburst 1000
+    # Capture during PHOTOCAL (16 intensity levels):
+    python3 saleae_capture.py photocal [hold_sec]
 
-    # Automated capture during PHOTOCAL:
-    python3 saleae_capture.py photocal 3
+    # Capture during BCMBURST:
+    python3 saleae_capture.py bcmburst [n_triggers]
 
-    # Manual capture with timed duration:
-    python3 saleae_capture.py manual 5
+    # Manual capture for a fixed duration:
+    python3 saleae_capture.py capture [duration_sec]
 
-    # Analyze previously exported CSV:
-    python3 saleae_capture.py analyze path/to/digital.csv
+    # Analyze a previously exported CSV:
+    python3 saleae_capture.py analyze <csv_path>
 """
 
-import os
 import sys
+import os
 import time
-import csv
 import json
-import argparse
-import statistics
-from pathlib import Path
-from datetime import datetime
+import serial
+import serial.tools.list_ports
 
-# Serial helpers (reuse from auto_test infrastructure)
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# ── Serial helpers (shared with auto_test.py) ─────────────────────────────
 
 BAUD = 115200
-CAPTURE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "saleae_captures")
-
-# ── Serial helpers ──────────────────────────────────────────────────────────
 
 def find_serial_port():
-    """Find the RP2350 serial port."""
-    import serial.tools.list_ports
-    for port in serial.tools.list_ports.comports():
-        if "usbmodem" in port.device and "306NTVSCY" not in port.device:
-            return port.device
-    for port in serial.tools.list_ports.comports():
-        if "usbmodem" in port.device:
-            return port.device
+    for p in serial.tools.list_ports.comports():
+        if "usbmodem" in p.device and "306NTVSCY" not in p.device:
+            return p.device
+    for p in serial.tools.list_ports.comports():
+        if "usbmodem" in p.device:
+            return p.device
     return None
 
-
-def open_serial(port=None):
-    """Open serial connection."""
-    import serial
-    if port is None:
-        port = find_serial_port()
-    if port is None:
+def open_serial():
+    port = find_serial_port()
+    if not port:
         print("ERROR: No serial port found")
         return None
     ser = serial.Serial(port, BAUD, timeout=2)
     time.sleep(1)
     ser.reset_input_buffer()
-    print(f"Serial connected: {port}")
+    print(f"Serial: {port}")
     return ser
 
-
 def send_cmd(ser, cmd, timeout=30, wait_for=None):
-    """Send command and collect response."""
     ser.reset_input_buffer()
     ser.write((cmd.strip() + '\r\n').encode())
     output = ''
@@ -97,540 +77,513 @@ def send_cmd(ser, cmd, timeout=30, wait_for=None):
             return output
     return output
 
+# ── Saleae Logic 2 automation ─────────────────────────────────────────────
 
-# ── Saleae Logic 2 automation ──────────────────────────────────────────────
-
-class SaleaeCapture:
-    """Wrapper around Logic 2 Automation API."""
-
-    def __init__(self, digital_channels=None, analog_channels=None,
-                 digital_sample_rate=100_000_000, analog_sample_rate=1_000_000):
-        self.digital_channels = digital_channels or [0, 1, 2, 3]
-        self.analog_channels = analog_channels or []
-        self.digital_sample_rate = digital_sample_rate
-        self.analog_sample_rate = analog_sample_rate
-        self.manager = None
-        self.capture = None
-
-    def connect(self, port=10430):
-        """Connect to Logic 2 automation server."""
-        try:
-            from saleae import automation
-            self.manager = automation.Manager.connect(port=port)
-            print(f"Connected to Logic 2 automation server (port {port})")
-            return True
-        except ImportError:
-            print("ERROR: saleae package not installed. Run: pip install logic2-automation")
-            return False
-        except Exception as e:
-            print(f"ERROR: Could not connect to Logic 2 automation server: {e}")
-            print("Make sure Logic 2 is running with automation enabled (port 10430)")
-            return False
-
-    def start_capture(self, duration_sec=None):
-        """Start a capture. If duration_sec is None, capture runs until stop()."""
+def connect_saleae(port=10430):
+    """Connect to Logic 2 automation server."""
+    try:
         from saleae import automation
+        manager = automation.Manager.connect(address="127.0.0.1", port=port)
+        print(f"Saleae: Connected to Logic 2 automation (port {port})")
+        return manager
+    except Exception as e:
+        print(f"ERROR: Could not connect to Logic 2 automation: {e}")
+        print("Make sure Logic 2 is running with automation enabled:")
+        print("  Preferences → Enable Scripting API → port 10430")
+        return None
 
-        device_config = automation.LogicDeviceConfiguration(
-            enabled_digital_channels=self.digital_channels,
-            enabled_analog_channels=self.analog_channels,
-            digital_sample_rate=self.digital_sample_rate,
-            analog_sample_rate=self.analog_sample_rate if self.analog_channels else None,
-        )
+def start_capture(manager, duration_sec=5.0, digital_channels=[0], analog_channels=[1],
+                  digital_rate=25_000_000, analog_rate=6_250_000):
+    """Start a timed capture. Returns capture object."""
+    from saleae import automation
 
-        if duration_sec:
-            capture_config = automation.CaptureConfiguration(
-                capture_mode=automation.TimedCaptureMode(duration_seconds=duration_sec)
-            )
-        else:
-            capture_config = automation.CaptureConfiguration()
+    device_config = automation.LogicDeviceConfiguration(
+        enabled_digital_channels=digital_channels,
+        enabled_analog_channels=analog_channels,
+        digital_sample_rate=digital_rate,
+        analog_sample_rate=analog_rate,
+    )
 
-        self.capture = self.manager.start_capture(
-            device_configuration=device_config,
-            capture_configuration=capture_config,
-        )
-        print(f"Capture started (digital: {self.digital_channels}, "
-              f"analog: {self.analog_channels}, "
-              f"rate: {self.digital_sample_rate/1e6:.0f} MHz)")
-        return self.capture
+    capture_config = automation.CaptureConfiguration(
+        capture_mode=automation.TimedCaptureMode(duration_seconds=duration_sec),
+    )
 
-    def stop_and_export(self, output_dir=None):
-        """Stop capture and export to CSV."""
-        from saleae import automation
+    print(f"Saleae: Starting capture ({duration_sec}s, "
+          f"digital={digital_channels}@{digital_rate/1e6:.0f}MHz, "
+          f"analog={analog_channels}@{analog_rate/1e6:.1f}MHz)")
 
-        if output_dir is None:
-            os.makedirs(CAPTURE_DIR, exist_ok=True)
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            output_dir = os.path.join(CAPTURE_DIR, timestamp)
-        os.makedirs(output_dir, exist_ok=True)
+    capture = manager.start_capture(
+        device_configuration=device_config,
+        capture_configuration=capture_config,
+    )
+    return capture
 
-        self.capture.stop()
-        print("Capture stopped.")
+def export_capture(capture, output_dir):
+    """Export capture data to CSV files."""
+    from saleae import automation
 
-        # Export digital data
-        digital_csv = os.path.join(output_dir, "digital.csv")
-        self.capture.export_raw_data_csv(
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Export raw analog data
+    try:
+        capture.export_raw_data_csv(
             directory=output_dir,
-            digital_channels=self.digital_channels,
-            analog_channels=self.analog_channels,
+            analog_channels=[1],
         )
-        print(f"Data exported to: {output_dir}")
-        return output_dir
+        print(f"Saleae: Exported analog data to {output_dir}/")
+    except Exception as e:
+        print(f"Warning: Analog export failed: {e}")
 
+    # Export digital data
+    try:
+        capture.export_raw_data_csv(
+            directory=output_dir,
+            digital_channels=[0],
+        )
+        print(f"Saleae: Exported digital data to {output_dir}/")
+    except Exception as e:
+        print(f"Warning: Digital export failed: {e}")
 
-# ── Analysis functions ─────────────────────────────────────────────────────
+    return output_dir
 
-def parse_digital_csv(csv_path):
-    """Parse Saleae digital CSV export.
+# ── Test workflows ────────────────────────────────────────────────────────
 
-    Logic 2 exports digital data as transition timestamps:
-    Time [s], Channel N
-    Each row is a transition event with timestamp and new value.
+def run_photocal_capture(hold_sec=3, manager=None):
+    """Run PHOTOCAL while capturing Saleae data."""
+    ser = open_serial()
+    if not ser:
+        return
 
-    Returns dict of channel_name -> list of (timestamp, value) tuples.
+    # Calculate capture duration: 16 levels × hold_sec + margin
+    capture_duration = 16 * hold_sec + 10
+
+    # Setup firmware
+    for cmd in ['ROWS 20', 'BCM 4', 'BCMON 0.5', 'FILL 15', 'EXTTRIG ON']:
+        send_cmd(ser, cmd, timeout=3)
+        time.sleep(0.3)
+
+    # Start Saleae capture if available
+    # Logic Pro 8 valid rate pairs: digital=500MHz/analog=12.5MHz is good for long captures
+    capture = None
+    if manager:
+        capture = start_capture(manager, duration_sec=capture_duration,
+                                digital_channels=[0], analog_channels=[1],
+                                digital_rate=500_000_000,  # 500 MHz digital
+                                analog_rate=12_500_000)    # 12.5 MHz analog
+    else:
+        print(f"No Saleae automation. Start manual capture now ({capture_duration}s).")
+        input("Press Enter when capture is running...")
+
+    # Run PHOTOCAL
+    time.sleep(1)
+    ser.reset_input_buffer()
+    print(f"\nRunning PHOTOCAL {hold_sec} ({16 * hold_sec}s)...")
+    ser.write(f'PHOTOCAL {hold_sec}\r\n'.encode())
+
+    # Collect serial output
+    out = ''
+    deadline = time.time() + capture_duration + 10
+    while time.time() < deadline:
+        n = ser.in_waiting
+        if n > 0:
+            chunk = ser.read(n).decode(errors='replace')
+            out += chunk
+            for line in chunk.split('\n'):
+                line = line.strip()
+                if line and (',' in line or 'PHOTOCAL' in line):
+                    print(f"  {line}")
+            if 'PHOTOCAL END' in out:
+                break
+        else:
+            time.sleep(0.1)
+
+    # Wait for capture to finish and export
+    if capture:
+        print("\nWaiting for Saleae capture to complete...")
+        capture.wait()
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        output_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                  "saleae_captures", f"photocal_{timestamp}")
+        export_capture(capture, output_dir)
+
+        # Save serial output alongside
+        with open(os.path.join(output_dir, "serial_output.txt"), 'w') as f:
+            f.write(out)
+        print(f"Serial output saved to {output_dir}/serial_output.txt")
+
+        # Parse and save structured results
+        results = parse_photocal_output(out)
+        if results:
+            with open(os.path.join(output_dir, "timing_results.json"), 'w') as f:
+                json.dump(results, f, indent=2)
+            print(f"Timing results saved to {output_dir}/timing_results.json")
+            print_photocal_summary(results)
+
+    ser.close()
+    return out
+
+def run_bcmburst_capture(n_triggers=10000, manager=None):
+    """Run BCMBURST while capturing Saleae data."""
+    ser = open_serial()
+    if not ser:
+        return
+
+    capture_duration = n_triggers / 8000 + 5  # triggers at 8kHz + margin
+
+    # Setup
+    for cmd in ['ROWS 20', 'BCM 4', 'BCMON 0.5', 'FILL 15', 'EXTTRIG ON']:
+        send_cmd(ser, cmd, timeout=3)
+        time.sleep(0.3)
+
+    # Start Saleae capture (50 MHz analog for short burst — timing precision)
+    capture = None
+    if manager:
+        capture = start_capture(manager, duration_sec=capture_duration,
+                                digital_channels=[0], analog_channels=[1],
+                                digital_rate=500_000_000,  # 500 MHz digital
+                                analog_rate=50_000_000)    # 50 MHz analog
+    else:
+        print(f"No Saleae automation. Start manual capture now ({capture_duration:.0f}s).")
+        input("Press Enter when capture is running...")
+
+    time.sleep(1)
+    ser.reset_input_buffer()
+    print(f"\nRunning BCMBURST {n_triggers} 8000 A...")
+    ser.write(f'BCMBURST {n_triggers} 8000 A\r\n'.encode())
+
+    out = ''
+    deadline = time.time() + capture_duration + 10
+    while time.time() < deadline:
+        n = ser.in_waiting
+        if n > 0:
+            out += ser.read(n).decode(errors='replace')
+            if 'BCMBURST END' in out:
+                break
+        else:
+            time.sleep(0.05)
+
+    print(out)
+
+    if capture:
+        print("\nWaiting for Saleae capture to complete...")
+        capture.wait()
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        output_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                  "saleae_captures", f"bcmburst_{timestamp}")
+        export_capture(capture, output_dir)
+        with open(os.path.join(output_dir, "serial_output.txt"), 'w') as f:
+            f.write(out)
+
+    ser.close()
+    return out
+
+def run_timing_capture(manager=None):
+    """Test 1: LED pulse timing relative to trigger.
+    Short capture (1s), high analog rate (50 MHz) to resolve rise/fall times.
+    Runs BCMBURST at full intensity so photodiode sees max signal.
     """
-    channels = {}
+    ser = open_serial()
+    if not ser:
+        return
+
+    # Setup: full intensity, external trigger
+    for cmd in ['ROWS 20', 'BCM 4', 'BCMON 0.5', 'FILL 15', 'EXTTRIG ON']:
+        send_cmd(ser, cmd, timeout=3)
+        time.sleep(0.3)
+
+    if not manager:
+        print("ERROR: Saleae automation required for timing capture")
+        ser.close()
+        return
+
+    # Start high-rate capture (1 second = ~8000 trigger cycles)
+    # Logic Pro 8 valid pair: digital=500MHz, analog=50MHz
+    capture = start_capture(manager, duration_sec=1.5,
+                            digital_channels=[0], analog_channels=[1],
+                            digital_rate=500_000_000,  # 500 MHz digital
+                            analog_rate=50_000_000)    # 50 MHz analog (20ns resolution)
+
+    # Run BCMBURST during capture
+    time.sleep(0.3)
+    ser.reset_input_buffer()
+    print("Running BCMBURST 10000 8000 A (capturing 1.5s window)...")
+    ser.write(b'BCMBURST 10000 8000 A\r\n')
+
+    # Wait for capture to finish (1.5s)
+    capture.wait()
+    print("Capture complete.")
+
+    # Export
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    output_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                              "saleae_captures", f"timing_{timestamp}")
+    export_capture(capture, output_dir)
+
+    # Collect remaining serial output
+    time.sleep(2)
+    out = ser.read(ser.in_waiting).decode(errors='replace')
+    # Wait for BCMBURST to finish
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        n = ser.in_waiting
+        if n > 0:
+            out += ser.read(n).decode(errors='replace')
+            if 'BCMBURST END' in out:
+                break
+        else:
+            time.sleep(0.1)
+    print(out)
+
+    with open(os.path.join(output_dir, "serial_output.txt"), 'w') as f:
+        f.write(out)
+
+    print(f"\nTiming data in: {output_dir}/")
+    print(f"  analog.csv: 50 MHz photodiode — zoom to 1 trigger period (125µs)")
+    print(f"  digital.csv: 50 MHz trigger edges")
+    print(f"  Analyze: average many pulses to get clean rise/fall profile")
+    ser.close()
+
+def run_linearity_capture(hold_sec=3, manager=None):
+    """Test 2: Intensity linearity across all 16 BCM levels.
+    Long capture, low analog rate (625 kHz) to keep file small.
+    PHOTOCAL cycles through levels with 0.5s OFF gaps for easy segmentation.
+    """
+    ser = open_serial()
+    if not ser:
+        return
+
+    # Calculate total duration: 16 levels × (hold_sec ON + 0.5s OFF gap) + margin
+    capture_duration = 16 * (hold_sec + 0.5) + 5
+
+    # Setup
+    for cmd in ['ROWS 20', 'BCM 4', 'BCMON 0.5', 'EXTTRIG ON']:
+        send_cmd(ser, cmd, timeout=3)
+        time.sleep(0.3)
+
+    if not manager:
+        print(f"No Saleae automation. Start manual capture now ({capture_duration:.0f}s).")
+        input("Press Enter when capture is running...")
+        capture = None
+    else:
+        # Low rate for small file. Valid pair: digital=6.25MHz, analog=781.25kHz
+        capture = start_capture(manager, duration_sec=capture_duration,
+                                digital_channels=[0], analog_channels=[1],
+                                digital_rate=6_250_000,    # 6.25 MHz trigger edges
+                                analog_rate=781_250)       # 781 kHz photodiode (~50 MB for 60s)
+
+    # Run PHOTOCAL
+    time.sleep(0.5)
+    ser.reset_input_buffer()
+    print(f"\nRunning PHOTOCAL {hold_sec} (16 levels × {hold_sec}s + gaps ≈ {capture_duration:.0f}s)...")
+    ser.write(f'PHOTOCAL {hold_sec}\r\n'.encode())
+
+    # Collect serial output with live progress
+    out = ''
+    deadline = time.time() + capture_duration + 15
+    while time.time() < deadline:
+        n = ser.in_waiting
+        if n > 0:
+            chunk = ser.read(n).decode(errors='replace')
+            out += chunk
+            for line in chunk.split('\n'):
+                line = line.strip()
+                if line and (',' in line or 'PHOTOCAL' in line or 'BCM' in line):
+                    print(f"  {line}")
+            if 'PHOTOCAL END' in out:
+                break
+        else:
+            time.sleep(0.1)
+
+    # Wait for Saleae and export
+    if capture:
+        print("\nWaiting for Saleae capture to complete...")
+        capture.wait()
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        output_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                  "saleae_captures", f"linearity_{timestamp}")
+        export_capture(capture, output_dir)
+
+        with open(os.path.join(output_dir, "serial_output.txt"), 'w') as f:
+            f.write(out)
+
+        results = parse_photocal_output(out)
+        if results:
+            with open(os.path.join(output_dir, "timing_results.json"), 'w') as f:
+                json.dump(results, f, indent=2)
+            print_photocal_summary(results)
+
+        print(f"\nLinearity data in: {output_dir}/")
+        print(f"  analog.csv: ~{capture_duration * 625000 * 10 / 1e6:.0f} MB photodiode voltage")
+        print(f"  Look for 16 voltage plateaus with dips between them")
+    else:
+        results = parse_photocal_output(out)
+        if results:
+            print_photocal_summary(results)
+
+    ser.close()
+
+def run_simple_capture(duration_sec=5.0, manager=None):
+    """Just capture Saleae data for a fixed duration (no firmware commands)."""
+    if not manager:
+        print("ERROR: Saleae automation required for simple capture")
+        return
+
+    capture = start_capture(manager, duration_sec=duration_sec,
+                            digital_channels=[0], analog_channels=[1],
+                            digital_rate=500_000_000,
+                            analog_rate=50_000_000)
+
+    print(f"Capturing for {duration_sec}s...")
+    capture.wait()
+
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    output_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                              "saleae_captures", f"capture_{timestamp}")
+    export_capture(capture, output_dir)
+    print("Done!")
+
+# ── Analysis ──────────────────────────────────────────────────────────────
+
+def parse_photocal_output(output):
+    """Parse PHOTOCAL serial output into structured data."""
+    results = []
+    for line in output.split('\n'):
+        line = line.strip()
+        parts = line.split(',')
+        if len(parts) == 7:
+            try:
+                level = int(parts[0])
+                results.append({
+                    'level': level,
+                    'burst_min_us': float(parts[1]),
+                    'burst_max_us': float(parts[2]),
+                    'burst_mean_us': float(parts[3]),
+                    'jitter_us': float(parts[4]),
+                    'outliers': int(parts[5]),
+                    'triggers': int(parts[6]),
+                })
+            except (ValueError, IndexError):
+                continue
+    return results
+
+def print_photocal_summary(results):
+    """Print a nice summary table of PHOTOCAL results."""
+    print("\n=== PHOTOCAL SUMMARY ===")
+    print(f"{'Level':>5} {'Burst(µs)':>10} {'Jitter(µs)':>11} {'Outliers':>8} {'Triggers':>8}")
+    print("-" * 48)
+    for r in results:
+        print(f"{r['level']:>5} {r['burst_mean_us']:>10.3f} {r['jitter_us']:>11.3f} "
+              f"{r['outliers']:>8} {r['triggers']:>8}")
+
+    total_triggers = sum(r['triggers'] for r in results)
+    total_outliers = sum(r['outliers'] for r in results)
+    max_jitter = max(r['jitter_us'] for r in results)
+    print("-" * 48)
+    print(f"Total triggers: {total_triggers}")
+    print(f"Total outliers: {total_outliers}")
+    print(f"Max jitter: {max_jitter:.3f} µs")
+
+def analyze_analog_csv(csv_path):
+    """Analyze exported Saleae analog CSV for photodiode linearity."""
+    import csv
+    import statistics
+
+    print(f"Analyzing: {csv_path}")
+
+    times = []
+    voltages = []
     with open(csv_path, 'r') as f:
         reader = csv.reader(f)
         header = next(reader)
-        # Parse channel names from header
-        for i, col in enumerate(header):
-            if i > 0:  # skip Time column
-                channels[col.strip()] = []
-
-        ch_names = list(channels.keys())
         for row in reader:
-            if not row or not row[0]:
-                continue
-            try:
-                t = float(row[0])
-                for i, name in enumerate(ch_names):
-                    if i + 1 < len(row) and row[i + 1].strip():
-                        channels[name].append((t, int(row[i + 1])))
-            except (ValueError, IndexError):
-                continue
+            if len(row) >= 2:
+                try:
+                    times.append(float(row[0]))
+                    voltages.append(float(row[1]))
+                except ValueError:
+                    continue
 
-    return channels
-
-
-def find_rising_edges(events):
-    """Find rising edge timestamps from a list of (time, value) transitions."""
-    edges = []
-    for i, (t, v) in enumerate(events):
-        if v == 1 and (i == 0 or events[i-1][1] == 0):
-            edges.append(t)
-    return edges
-
-
-def find_falling_edges(events):
-    """Find falling edge timestamps from a list of (time, value) transitions."""
-    edges = []
-    for i, (t, v) in enumerate(events):
-        if v == 0 and (i > 0 and events[i-1][1] == 1):
-            edges.append(t)
-    return edges
-
-
-def find_pulse_durations(events):
-    """Find HIGH pulse durations from transition events."""
-    durations = []
-    rise_time = None
-    for t, v in events:
-        if v == 1:
-            rise_time = t
-        elif v == 0 and rise_time is not None:
-            durations.append(t - rise_time)
-            rise_time = None
-    return durations
-
-
-def analyze_trigger_signal(trigger_events):
-    """Analyze trigger signal: period, frequency, duty cycle."""
-    rising = find_rising_edges(trigger_events)
-    falling = find_falling_edges(trigger_events)
-
-    if len(rising) < 2:
-        print("  Not enough trigger edges for analysis")
-        return {}
-
-    periods = [rising[i+1] - rising[i] for i in range(len(rising)-1)]
-    frequencies = [1.0 / p for p in periods if p > 0]
-    pulses = find_pulse_durations(trigger_events)
-
-    result = {
-        'n_edges': len(rising),
-        'period_mean_us': statistics.mean(periods) * 1e6,
-        'period_stdev_us': statistics.stdev(periods) * 1e6 if len(periods) > 1 else 0,
-        'freq_mean_hz': statistics.mean(frequencies),
-        'freq_stdev_hz': statistics.stdev(frequencies) if len(frequencies) > 1 else 0,
-    }
-    if pulses:
-        result['duty_cycle_pct'] = statistics.mean(pulses) / statistics.mean(periods) * 100
-
-    return result
-
-
-def analyze_burst_timing(trigger_events, row_events):
-    """Analyze burst timing: trigger-to-burst latency, burst duration, jitter.
-
-    Uses Row 0 HIGH periods as burst indicators (since GP46 sync not available).
-    Row 0 is active every 20 triggers (once per frame at 400 Hz).
-    """
-    trigger_rising = find_rising_edges(trigger_events)
-    row_pulses = find_pulse_durations(row_events)
-    row_rising = find_rising_edges(row_events)
-
-    result = {}
-
-    # Burst duration from row HIGH time
-    if row_pulses:
-        result['burst_durations_us'] = [d * 1e6 for d in row_pulses]
-        result['burst_mean_us'] = statistics.mean(result['burst_durations_us'])
-        result['burst_min_us'] = min(result['burst_durations_us'])
-        result['burst_max_us'] = max(result['burst_durations_us'])
-        result['burst_jitter_us'] = result['burst_max_us'] - result['burst_min_us']
-        if len(result['burst_durations_us']) > 1:
-            result['burst_stdev_us'] = statistics.stdev(result['burst_durations_us'])
-        result['n_bursts'] = len(row_pulses)
-
-    # Trigger-to-burst latency: find nearest trigger edge before each row rising edge
-    if trigger_rising and row_rising:
-        latencies = []
-        trig_idx = 0
-        for row_t in row_rising:
-            # Find the trigger edge just before this row activation
-            while trig_idx < len(trigger_rising) - 1 and trigger_rising[trig_idx + 1] <= row_t:
-                trig_idx += 1
-            if trig_idx < len(trigger_rising) and trigger_rising[trig_idx] <= row_t:
-                latency = row_t - trigger_rising[trig_idx]
-                if latency < 0.001:  # sanity: < 1ms
-                    latencies.append(latency)
-
-        if latencies:
-            result['latency_mean_us'] = statistics.mean(latencies) * 1e6
-            result['latency_max_us'] = max(latencies) * 1e6
-            result['latency_min_us'] = min(latencies) * 1e6
-            result['n_latency_samples'] = len(latencies)
-
-    return result
-
-
-def analyze_bcm_pattern(col_events, row_events):
-    """Analyze BCM bit-plane pattern on a column pin during row activation.
-
-    During each row burst, the column should show 4 bit-plane pulses
-    with durations in ratio 1:2:4:8 (for 4-bit BCM).
-    """
-    row_rising = find_rising_edges(row_events)
-    row_falling = find_falling_edges(row_events)
-
-    if not row_rising or not row_falling:
-        return {}
-
-    # For each row burst, extract column pulse pattern
-    burst_patterns = []
-    for i in range(min(len(row_rising), len(row_falling))):
-        r_start = row_rising[i]
-        r_end = row_falling[i] if i < len(row_falling) else row_rising[i] + 0.001
-
-        # Find column transitions during this burst
-        col_pulses = []
-        pulse_start = None
-        for t, v in col_events:
-            if t < r_start:
-                if v == 0:  # column LOW = LED ON (reversed polarity)
-                    pulse_start = t
-                continue
-            if t > r_end:
-                break
-            if v == 0:  # LED ON (column LOW for reversed polarity)
-                pulse_start = t
-            elif v == 1 and pulse_start is not None:  # LED OFF
-                col_pulses.append((t - max(pulse_start, r_start)) * 1e6)  # µs
-                pulse_start = None
-
-        if col_pulses:
-            burst_patterns.append(col_pulses)
-
-    if not burst_patterns:
-        return {}
-
-    result = {
-        'n_bursts_analyzed': len(burst_patterns),
-        'example_pattern_us': burst_patterns[0] if burst_patterns else [],
-    }
-
-    # Check BCM ratio for first few bursts
-    if burst_patterns:
-        first = burst_patterns[0]
-        if len(first) >= 2:
-            ratios = [p / first[0] for p in first]
-            result['bit_plane_ratios'] = [round(r, 1) for r in ratios]
-            expected = [1, 2, 4, 8][:len(first)]
-            result['expected_ratios'] = expected
-            result['ratio_match'] = all(
-                abs(r - e) / e < 0.15 for r, e in zip(ratios, expected)
-            )
-
-    return result
-
-
-def print_analysis_report(trigger_analysis, burst_analysis, bcm_analysis=None):
-    """Print a formatted analysis report."""
-    print("\n" + "=" * 60)
-    print("SALEAE TIMING ANALYSIS REPORT")
-    print("=" * 60)
-
-    if trigger_analysis:
-        print("\n--- Trigger Signal (GP45) ---")
-        print(f"  Edges detected:  {trigger_analysis.get('n_edges', 0)}")
-        print(f"  Period:          {trigger_analysis.get('period_mean_us', 0):.1f} ± "
-              f"{trigger_analysis.get('period_stdev_us', 0):.3f} µs")
-        print(f"  Frequency:       {trigger_analysis.get('freq_mean_hz', 0):.1f} ± "
-              f"{trigger_analysis.get('freq_stdev_hz', 0):.1f} Hz")
-        if 'duty_cycle_pct' in trigger_analysis:
-            print(f"  Duty cycle:      {trigger_analysis['duty_cycle_pct']:.1f}%")
-
-    if burst_analysis:
-        print("\n--- Burst Timing (from GP21 Row 0) ---")
-        print(f"  Bursts measured: {burst_analysis.get('n_bursts', 0)}")
-        if 'burst_mean_us' in burst_analysis:
-            print(f"  Duration:        {burst_analysis['burst_mean_us']:.3f} µs "
-                  f"(min={burst_analysis['burst_min_us']:.3f}, "
-                  f"max={burst_analysis['burst_max_us']:.3f})")
-            print(f"  Jitter (max-min): {burst_analysis['burst_jitter_us']:.3f} µs")
-            if 'burst_stdev_us' in burst_analysis:
-                print(f"  Stdev:           {burst_analysis['burst_stdev_us']:.3f} µs")
-        if 'latency_mean_us' in burst_analysis:
-            print(f"\n  Trigger→Burst latency:")
-            print(f"    Mean:  {burst_analysis['latency_mean_us']:.3f} µs")
-            print(f"    Max:   {burst_analysis['latency_max_us']:.3f} µs")
-            print(f"    Min:   {burst_analysis['latency_min_us']:.3f} µs")
-
-    if bcm_analysis:
-        print("\n--- BCM Pattern (GP1 Column 0) ---")
-        print(f"  Bursts analyzed: {bcm_analysis.get('n_bursts_analyzed', 0)}")
-        if 'example_pattern_us' in bcm_analysis:
-            patt = bcm_analysis['example_pattern_us']
-            print(f"  Bit-plane durations: {[f'{p:.2f}' for p in patt]} µs")
-        if 'bit_plane_ratios' in bcm_analysis:
-            print(f"  Measured ratios: {bcm_analysis['bit_plane_ratios']}")
-            print(f"  Expected ratios: {bcm_analysis['expected_ratios']}")
-            print(f"  Ratio match:     {'✅ YES' if bcm_analysis.get('ratio_match') else '✗ NO'}")
-
-    print("\n" + "=" * 60)
-
-
-# ── High-level capture workflows ──────────────────────────────────────────
-
-def capture_bcmburst(n_triggers=1000, mode='A', use_exttrig=False):
-    """Capture a BCMBURST test with Saleae + serial."""
-    import serial
-
-    ser = open_serial()
-    if not ser:
+    if not voltages:
+        print("No data found in CSV")
         return
 
-    sc = SaleaeCapture(
-        digital_channels=[0, 1, 2, 3],
-        analog_channels=[],
-    )
-    if not sc.connect():
-        print("\nFalling back to manual capture mode.")
-        print("1. Start capture in Logic 2 manually")
-        input("2. Press Enter when capture is running...")
+    print(f"  Samples: {len(voltages)}")
+    print(f"  Duration: {times[-1] - times[0]:.2f}s")
+    print(f"  Voltage range: {min(voltages):.4f}V — {max(voltages):.4f}V")
 
-    # Setup firmware
-    for cmd in ['ROWS 20', 'BCM 4', 'BCMON 0.5', 'FILL 15']:
-        send_cmd(ser, cmd, timeout=3)
-        time.sleep(0.5)
+    # Segment by time into 16 levels (if PHOTOCAL was running)
+    total_duration = times[-1] - times[0]
+    n_levels = 16
+    level_duration = total_duration / n_levels
 
-    if use_exttrig:
-        send_cmd(ser, 'EXTTRIG ON', timeout=3)
-        time.sleep(0.3)
+    print(f"\n{'Level':>5} {'Mean V':>8} {'Std V':>8} {'Samples':>8}")
+    print("-" * 34)
 
-    time.sleep(0.5)
-    ser.reset_input_buffer()
+    level_means = []
+    for level in range(n_levels):
+        t_start = times[0] + level * level_duration
+        t_end = t_start + level_duration
+        level_v = [v for t, v in zip(times, voltages) if t_start <= t < t_end]
+        if level_v:
+            mean_v = statistics.mean(level_v)
+            std_v = statistics.stdev(level_v) if len(level_v) > 1 else 0
+            level_means.append(mean_v)
+            print(f"{level:>5} {mean_v:>8.4f} {std_v:>8.4f} {len(level_v):>8}")
 
-    # Start capture
-    duration = n_triggers / 8000 + 2  # add 2s buffer
-    if sc.manager:
-        sc.start_capture(duration_sec=duration)
-        time.sleep(0.5)
+    if len(level_means) >= 2:
+        print(f"\nLinearity check:")
+        print(f"  Level 0 voltage:  {level_means[0]:.4f}V")
+        print(f"  Level 15 voltage: {level_means[-1]:.4f}V")
+        print(f"  Range: {level_means[-1] - level_means[0]:.4f}V")
+        monotonic = all(level_means[i] <= level_means[i+1] for i in range(len(level_means)-1))
+        print(f"  Monotonic increasing: {'YES' if monotonic else 'NO'}")
 
-    # Run BCMBURST
-    print(f"\nSending BCMBURST {n_triggers} 8000 {mode}...")
-    out = send_cmd(ser, f'BCMBURST {n_triggers} 8000 {mode}',
-                   timeout=int(duration + 10), wait_for='BCMBURST END')
-    print("Firmware response:")
-    if out:
-        for line in out.strip().split('\n'):
-            print(f"  {line}")
-
-    # Export
-    if sc.manager and sc.capture:
-        output_dir = sc.stop_and_export()
-        # Analyze
-        digital_csv = os.path.join(output_dir, "digital.csv")
-        if os.path.exists(digital_csv):
-            analyze_csv(digital_csv)
-    else:
-        print("\nManual capture mode: stop capture in Logic 2, export CSV, then run:")
-        print(f"  python3 {__file__} analyze <path/to/digital.csv>")
-
-    ser.close()
-
-
-def capture_photocal(hold_sec=3, use_exttrig=False):
-    """Capture a PHOTOCAL test with Saleae (including analog for photodiode)."""
-    import serial
-
-    ser = open_serial()
-    if not ser:
-        return
-
-    sc = SaleaeCapture(
-        digital_channels=[0, 1, 2],
-        analog_channels=[0],  # photodiode on analog channel 0
-        analog_sample_rate=1_000_000,
-    )
-    if not sc.connect():
-        print("\nFalling back to manual capture mode.")
-        input("Start capture in Logic 2, then press Enter...")
-
-    # Setup
-    for cmd in ['ROWS 20', 'BCM 4', 'BCMON 0.5']:
-        send_cmd(ser, cmd, timeout=3)
-        time.sleep(0.5)
-
-    if use_exttrig:
-        send_cmd(ser, 'EXTTRIG ON', timeout=3)
-        time.sleep(0.3)
-
-    time.sleep(0.5)
-    ser.reset_input_buffer()
-
-    # PHOTOCAL runs 16 levels x hold_sec each
-    total_time = 16 * hold_sec + 10  # buffer
-
-    if sc.manager:
-        sc.start_capture(duration_sec=total_time)
-        time.sleep(0.5)
-
-    print(f"\nSending PHOTOCAL {hold_sec}...")
-    out = send_cmd(ser, f'PHOTOCAL {hold_sec}',
-                   timeout=int(total_time + 30), wait_for='PHOTOCAL END')
-    print("Firmware response:")
-    if out:
-        for line in out.strip().split('\n'):
-            print(f"  {line}")
-
-    if sc.manager and sc.capture:
-        output_dir = sc.stop_and_export()
-        print(f"\nCapture saved to: {output_dir}")
-        print("Analyze with: python3 saleae_capture.py analyze <path/to/digital.csv>")
-    else:
-        print("\nManual capture mode: stop capture, export CSV, then analyze.")
-
-    ser.close()
-
-
-def capture_manual(duration_sec=5):
-    """Start a timed capture without sending any serial commands."""
-    sc = SaleaeCapture(
-        digital_channels=[0, 1, 2, 3],
-        analog_channels=[0],
-        analog_sample_rate=1_000_000,
-    )
-    if not sc.connect():
-        print("Cannot connect to Logic 2. Capture manually.")
-        return
-
-    sc.start_capture(duration_sec=duration_sec)
-    print(f"Capturing for {duration_sec} seconds...")
-    time.sleep(duration_sec + 1)
-
-    output_dir = sc.stop_and_export()
-    print(f"Saved to: {output_dir}")
-
-
-def analyze_csv(csv_path):
-    """Analyze a previously exported Saleae digital CSV."""
-    print(f"Analyzing: {csv_path}")
-    channels = parse_digital_csv(csv_path)
-
-    if not channels:
-        print("ERROR: No data found in CSV")
-        return
-
-    print(f"Channels found: {list(channels.keys())}")
-    for name, events in channels.items():
-        print(f"  {name}: {len(events)} transitions")
-
-    # Map channels by position (D0=trigger, D1=col0, D2=row0, D3=col1)
-    ch_names = list(channels.keys())
-    trigger_events = channels.get(ch_names[0], []) if len(ch_names) > 0 else []
-    col0_events = channels.get(ch_names[1], []) if len(ch_names) > 1 else []
-    row0_events = channels.get(ch_names[2], []) if len(ch_names) > 2 else []
-
-    trigger_analysis = analyze_trigger_signal(trigger_events) if trigger_events else {}
-    burst_analysis = analyze_burst_timing(trigger_events, row0_events) if row0_events else {}
-    bcm_analysis = analyze_bcm_pattern(col0_events, row0_events) if col0_events and row0_events else {}
-
-    print_analysis_report(trigger_analysis, burst_analysis, bcm_analysis)
-
-    # Save results as JSON
-    results = {
-        'csv_path': csv_path,
-        'timestamp': datetime.now().isoformat(),
-        'trigger': trigger_analysis,
-        'burst': {k: v for k, v in burst_analysis.items() if k != 'burst_durations_us'},
-        'bcm': bcm_analysis,
-    }
-    json_path = csv_path.replace('.csv', '_analysis.json')
-    with open(json_path, 'w') as f:
-        json.dump(results, f, indent=2, default=str)
-    print(f"\nResults saved to: {json_path}")
-
-
-# ── Main ───────────────────────────────────────────────────────────────────
+# ── Main ──────────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description='Saleae Logic 2 capture & analysis for G6 panel')
-    subparsers = parser.add_subparsers(dest='command')
+    if len(sys.argv) < 2:
+        print("Usage:")
+        print("  python3 saleae_capture.py timing               — LED pulse timing (1.5s, 50MHz)")
+        print("  python3 saleae_capture.py linearity [hold_sec]  — intensity linearity (16 levels)")
+        print("  python3 saleae_capture.py photocal [hold_sec]   — capture + PHOTOCAL")
+        print("  python3 saleae_capture.py bcmburst [n_triggers]  — capture + BCMBURST")
+        print("  python3 saleae_capture.py capture [duration_sec] — simple capture")
+        print("  python3 saleae_capture.py analyze <csv_path>     — analyze exported CSV")
+        return
 
-    # bcmburst
-    p_burst = subparsers.add_parser('bcmburst', help='Capture BCMBURST test')
-    p_burst.add_argument('n_triggers', type=int, nargs='?', default=1000)
-    p_burst.add_argument('--mode', default='A', choices=['A', 'B', 'C'])
-    p_burst.add_argument('--exttrig', action='store_true', help='Use external trigger')
+    action = sys.argv[1].lower()
 
-    # photocal
-    p_photo = subparsers.add_parser('photocal', help='Capture PHOTOCAL linearity test')
-    p_photo.add_argument('hold_sec', type=float, nargs='?', default=3)
-    p_photo.add_argument('--exttrig', action='store_true')
+    if action == "analyze":
+        if len(sys.argv) < 3:
+            print("Usage: python3 saleae_capture.py analyze <csv_path>")
+            return
+        analyze_analog_csv(sys.argv[2])
+        return
 
-    # manual
-    p_manual = subparsers.add_parser('manual', help='Timed capture (no serial commands)')
-    p_manual.add_argument('duration', type=float, nargs='?', default=5)
+    # Try connecting to Saleae
+    manager = connect_saleae()
 
-    # analyze
-    p_analyze = subparsers.add_parser('analyze', help='Analyze exported CSV')
-    p_analyze.add_argument('csv_path', help='Path to Saleae digital CSV export')
+    if action == "timing":
+        run_timing_capture(manager=manager)
 
-    args = parser.parse_args()
+    elif action == "linearity":
+        hold_sec = int(sys.argv[2]) if len(sys.argv) > 2 else 3
+        run_linearity_capture(hold_sec=hold_sec, manager=manager)
 
-    if args.command == 'bcmburst':
-        capture_bcmburst(args.n_triggers, args.mode, args.exttrig)
-    elif args.command == 'photocal':
-        capture_photocal(args.hold_sec, args.exttrig)
-    elif args.command == 'manual':
-        capture_manual(args.duration)
-    elif args.command == 'analyze':
-        analyze_csv(args.csv_path)
+    elif action == "photocal":
+        hold_sec = int(sys.argv[2]) if len(sys.argv) > 2 else 3
+        run_photocal_capture(hold_sec=hold_sec, manager=manager)
+
+    elif action == "bcmburst":
+        n = int(sys.argv[2]) if len(sys.argv) > 2 else 10000
+        run_bcmburst_capture(n_triggers=n, manager=manager)
+
+    elif action == "capture":
+        dur = float(sys.argv[2]) if len(sys.argv) > 2 else 5.0
+        run_simple_capture(duration_sec=dur, manager=manager)
+
     else:
-        parser.print_help()
-
+        print(f"Unknown action: {action}")
 
 if __name__ == "__main__":
     main()

@@ -3096,9 +3096,18 @@ done:
 }
 
 static void cmd_photocal(const char* arg) {
+    // PHOTOCAL [hold_sec] [row] — cycle 16 BCM levels with gaps for Saleae parsing
+    // row = which single row to light (-1 = all rows, default = 0)
     float hold_sec = 3.0f;
-    if (arg && *arg) hold_sec = strtof(arg, nullptr);
+    int cal_row = 0;  // default: row 0 only
+    if (arg && *arg) {
+        char* end;
+        hold_sec = strtof(arg, &end);
+        while (*end == ' ') end++;
+        if (*end) cal_row = atoi(end);  // optional row argument
+    }
     if (hold_sec < 0.5f || hold_sec > 60.0f) hold_sec = 3.0f;
+    if (cal_row < -1 || cal_row >= (int)active_rows) cal_row = 0;
 
     if (!pio_loaded && !pio_init_program()) return;
 
@@ -3116,6 +3125,9 @@ static void cmd_photocal(const char* arg) {
     delay(50);
     while (Serial.available()) Serial.read();
 
+    float gap_sec = 0.5f;  // all-OFF gap between levels for easy Saleae parsing
+    uint32_t gap_triggers = (uint32_t)(gap_sec * rate);
+
     Serial.println("--- PHOTOCAL START ---");
     Serial.print("BCM bits=");
     Serial.print(bcm_bits);
@@ -3123,7 +3135,11 @@ static void cmd_photocal(const char* arg) {
     Serial.print(bcm_base_on_us, 3);
     Serial.print("us  Hold=");
     Serial.print(hold_sec, 1);
-    Serial.print("s  Rate=");
+    Serial.print("s  Gap=");
+    Serial.print(gap_sec, 1);
+    Serial.print("s  Row=");
+    Serial.print(cal_row == -1 ? "ALL" : String(cal_row).c_str());
+    Serial.print("  Rate=");
     Serial.print(rate, 0);
     Serial.print("Hz  Trig=");
     Serial.println(trig_mode == TRIG_EXT ? "EXT" : "DWT");
@@ -3147,8 +3163,13 @@ static void cmd_photocal(const char* arg) {
     }
 
     for (int level = 0; level < (1 << bcm_bits); level++) {
-        // Set all pixels to this intensity
-        memset(pixel_data, level, sizeof(pixel_data));
+        // Set pixels: only cal_row lit (or all rows if cal_row == -1)
+        memset(pixel_data, 0, sizeof(pixel_data));
+        if (cal_row == -1) {
+            memset(pixel_data, level, sizeof(pixel_data));
+        } else {
+            memset(pixel_data[cal_row], level, PANEL_SIZE);
+        }
         precompute_bcm_data();
 
         stats_reset();
@@ -3234,6 +3255,25 @@ static void cmd_photocal(const char* arg) {
         }
 
         if (timeout) break;
+
+        // Gap: all-OFF for gap_sec seconds (makes Saleae segmentation trivial)
+        memset(pixel_data, 0, sizeof(pixel_data));
+        precompute_bcm_data();
+        for (uint32_t g = 0; g < gap_triggers; g++) {
+            if (!wait_for_trigger(&trigger_start, trigger_period_cyc)) break;
+            noInterrupts();
+            gpio_set_mask64(row_on_mask[row]);
+            for (int b = 0; b < bcm_bits; b++) {
+                pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, bcm_plane_data[row][b][0]);
+                pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, bcm_plane_data[row][b][1]);
+                while (!pio_interrupt_get(pio_hw_inst, 0)) {}
+                pio_interrupt_clear(pio_hw_inst, 0);
+            }
+            gpio_clr_mask64(row_on_mask[row]);
+            interrupts();
+            row++;
+            if (row >= active_rows) row = 0;
+        }
     }
 
     Serial.println("--- PHOTOCAL END ---");
