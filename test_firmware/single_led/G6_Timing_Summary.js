@@ -174,7 +174,107 @@ s2.addText("Result: 0.000 µs jitter across 640,000 measurements — confirmed w
 });
 
 // =========================================================================
-// SLIDE 3: BCM Results Table
+// SLIDE 3: PIO Scanning & BCM Validation
+// =========================================================================
+let s2b = pres.addSlide();
+s2b.background = { color: C.white };
+
+s2b.addText("PIO-Driven BCM Scanning", {
+  x: 0.6, y: 0.3, w: 9, h: 0.7,
+  fontSize: 32, fontFace: "Arial Black", color: C.navy, bold: true, margin: 0,
+});
+
+s2b.addText("Hardware-timed column patterns via RP2350 Programmable I/O", {
+  x: 0.6, y: 0.9, w: 9, h: 0.4,
+  fontSize: 14, fontFace: "Calibri", color: C.gray, italic: true, margin: 0,
+});
+
+// Left: PIO explanation
+s2b.addText("How It Works", {
+  x: 0.6, y: 1.5, w: 4.4, h: 0.4,
+  fontSize: 16, fontFace: "Calibri", color: C.navy, bold: true, margin: 0,
+});
+
+const pioSteps = [
+  { step: "1", title: "Trigger arrives (GP45)", desc: "External 8 kHz pulse from microscope" },
+  { step: "2", title: "CPU activates row GPIO", desc: "gpio_set_mask64() — one of 20 rows" },
+  { step: "3", title: "PIO drives 4 bit-planes", desc: "out pins, 20 sets all columns in 1 cycle" },
+  { step: "", title: "  B0: 0.5 µs  (weight 1)", desc: "" },
+  { step: "", title: "  B1: 1.0 µs  (weight 2)", desc: "" },
+  { step: "", title: "  B2: 2.0 µs  (weight 4)", desc: "" },
+  { step: "", title: "  B3: 4.0 µs  (weight 8)", desc: "" },
+  { step: "4", title: "CPU deactivates row", desc: "Total burst: 9.5 µs — fits 15 µs budget" },
+  { step: "5", title: "Idle: 115 µs", desc: "SPI frame loading, precompute, USB" },
+];
+
+pioSteps.forEach((s, i) => {
+  const y = 1.95 + i * 0.37;
+  if (s.step) {
+    s2b.addShape(pres.shapes.OVAL, {
+      x: 0.6, y: y + 0.02, w: 0.28, h: 0.28,
+      fill: { color: C.accent },
+    });
+    s2b.addText(s.step, {
+      x: 0.6, y: y + 0.02, w: 0.28, h: 0.28,
+      fontSize: 12, fontFace: "Calibri", color: C.darkNavy, bold: true,
+      align: "center", valign: "middle", margin: 0,
+    });
+  }
+  s2b.addText(s.title, {
+    x: s.step ? 1.0 : 1.2, y: y, w: 2.4, h: 0.32,
+    fontSize: s.step ? 12 : 11, fontFace: s.desc ? "Calibri" : "Consolas",
+    color: s.step ? C.navy : C.gray, bold: !!s.step, margin: 0,
+  });
+  if (s.desc) {
+    s2b.addText(s.desc, {
+      x: 3.4, y: y, w: 1.8, h: 0.32,
+      fontSize: 10, fontFace: "Calibri", color: C.gray, margin: 0,
+    });
+  }
+});
+
+// Right: Validation image
+s2b.addText("Saleae Optical Validation", {
+  x: 5.3, y: 1.5, w: 4.2, h: 0.4,
+  fontSize: 16, fontFace: "Calibri", color: C.navy, bold: true, margin: 0,
+});
+
+s2b.addText("499 pulses averaged at 50 MHz — BCM bit-plane structure confirmed", {
+  x: 5.3, y: 1.9, w: 4.2, h: 0.3,
+  fontSize: 11, fontFace: "Calibri", color: C.gray, margin: 0,
+});
+
+// Embed the pulse average image
+const fs = require("fs");
+const b64Data = fs.readFileSync("bcm_pulse_b64.txt", "utf8").trim();
+s2b.addImage({
+  data: "image/png;base64," + b64Data,
+  x: 5.2, y: 2.3, w: 4.4, h: 2.2,
+});
+
+// Labels for bit-planes on the image
+s2b.addText("B0  B1   B2      B3", {
+  x: 5.8, y: 4.5, w: 3.0, h: 0.3,
+  fontSize: 11, fontFace: "Consolas", color: C.accent, margin: 0,
+});
+
+s2b.addText("← 9.5 µs burst →", {
+  x: 6.0, y: 4.75, w: 2.5, h: 0.25,
+  fontSize: 10, fontFace: "Consolas", color: C.gray, margin: 0,
+});
+
+// Bottom: key insight
+s2b.addShape(pres.shapes.RECTANGLE, {
+  x: 0, y: 5.25, w: 10, h: 0.375,
+  fill: { color: C.navy },
+});
+s2b.addText("PIO out pins, 20 drives all columns in 1 clock cycle (6.67 ns) — CPU only manages row switching", {
+  x: 0.5, y: 5.27, w: 9, h: 0.35,
+  fontSize: 12, fontFace: "Calibri", color: C.accent, bold: true, margin: 0,
+});
+
+// =========================================================================
+// SLIDE 4: BCM Results Table (was slide 3)
 // =========================================================================
 let s3 = pres.addSlide();
 s3.background = { color: C.white };
