@@ -111,6 +111,7 @@ python3 test_firmware/single_led/auto_test.py cmd "BURST 10000"
 - **Phase 3e**: Burst-mode scanning — simulated 8 kHz trigger, `noInterrupts()` during scan burst. Confirmed zero jitter (0.000 µs) for PIOSCAN burst mode.
 - **Phase 4**: BCM grayscale — single-row-per-trigger BCM with 3 modes (PIO/DMA/MSM). **Zero jitter achieved** with multicore lockout + noInterrupts + noinline + warm-up. Full sweep: 640k measurements, all showing 0.007 µs jitter (1 cycle), 0 outliers. 4-bit BCM at T=0.5 µs: 9.49 µs burst, fits 15 µs with 5.5 µs margin. 400 Hz frame rate. Visually verified (BCMDEMO ramp test).
 - **Phase 5a**: RAMBURST — production-realistic frame loading. 8 test frames cycling at 400 Hz from RAM, incremental per-row precompute (38 µs/row during 115 µs idle). **0.007 µs jitter** with frame swaps happening. Critical `noinline` bug found and fixed: compiler was silently inlining `__not_in_flash_func` into flash callers.
+- **Phase 6**: External trigger + optical characterization — GP45 external trigger (bodge wire), zero jitter confirmed with real 8 kHz waveform generator. PHOTOCAL command cycles 16 BCM levels. Saleae Logic Pro 8 automation via Python API. Pulse-triggered averaging resolves BCM bit-plane structure (B0-B3 at 1:2:4:8 ratio) in photodiode signal. BCMWEIGHTS command for custom bit-plane weights (6.67 ns resolution) to enable linearity calibration.
 
 ## Key Technical Findings
 
@@ -161,14 +162,23 @@ At 150 MHz, 8 kHz trigger, Mode A (PIO + multicore lockout + noInterrupts + warm
 
 Modes B (DMA) and C (MSM/DMA) are ~1.3 µs faster but introduce jitter from DMA interrupt overhead. Mode A is the only mode suitable for 2P sync.
 
+### External trigger zero jitter confirmed (Phase 6)
+BCMBURST 10000 with real 8 kHz external trigger on GP45: 0.000 µs jitter, 9.507 µs burst. Per-burst noInterrupts + Core 1 lockout + warm-up achieves zero jitter even with external trigger.
+
+### BCM bit-plane weights are fully configurable
+`BCMWEIGHTS` command accepts arbitrary float weights (e.g., 1.2, 2.2, 4.1, 8.0) with 6.67 ns resolution (1 CPU cycle at 150 MHz). Enables linearization of LED output by adjusting bit-plane durations based on measured response curves.
+
+### Saleae Logic Pro 8 integration
+Python automation via `saleae_capture.py` using Logic 2 API. Captures digital trigger + analog photodiode simultaneously. Pulse-triggered averaging across 499 pulses at 50 MHz resolves individual BCM bit-planes and ~0.4 µs PIO overhead gaps.
+
 ## Next Steps
 
 ### Immediate
-1. **External trigger interface** — GPIO interrupt or PIO `wait pin` for 2P sync. Replace simulated DWT trigger with real hardware input from microscope.
-2. **Overclock to 200 MHz** — Optional. Would expand T range (4-bit T≤1.0 µs in 15 µs) but not required since T=0.5 µs already works at 150 MHz.
+1. **Optical linearity characterization** — Use Ocean Optics spectrometer with integration time averaging for calibrated BCM linearity measurement. Sweep T x intensity to build 2D response map. Calibrate BCMWEIGHTS for linearized output.
+2. **Probe LED pin (GP1) on Saleae** — Measure trigger-to-LED latency and confirm bit-plane timing directly on column driver pin (eliminates photodiode bandwidth uncertainty).
+3. **PCB redesign** — See PCB_REDESIGN_ANALYSIS.md. Option B (add EINT trace to GP45) recommended for next revision.
 
-### After trigger is working
-- **Optical characterization** — photodiode + external ADC to measure LED linearity, rise/fall time, load-dependent brightness. Build calibration LUT if needed.
+### After optical calibration
 - **Per-pixel pattern loading** — USB or SPI interface for host to send pixel_data[20][20] frames
 
 ### Completed explorations
@@ -179,6 +189,9 @@ Modes B (DMA) and C (MSM/DMA) are ~1.3 µs faster but introduce jitter from DMA 
 - ~~**Multicore lockout for zero jitter**~~ — Implemented. lockout + noInterrupts + noinline + warm-up = 0.007 µs jitter.
 - ~~**`noinline` requirement for `__not_in_flash_func`**~~ — Discovered (Phase 5a). Compiler silently inlines static `__not_in_flash_func` into flash callers, defeating SRAM placement. Caused 0→7 µs jitter regression. Fix: always pair with `__attribute__((noinline))`.
 - ~~**RAM frame loading at 400 Hz**~~ — Validated (Phase 5a RAMBURST). Incremental per-row precompute (38 µs/row) fits in 115 µs idle. 0.007 µs jitter with 8-frame cycling.
+- ~~**External trigger interface**~~ — Implemented (Phase 6). GP45 bodge wire, real 8 kHz waveform generator. Zero jitter confirmed with external trigger.
+- ~~**Optical characterization (initial)**~~ — Photodiode + Saleae pulse-triggered averaging resolves BCM bit-planes. BCMWEIGHTS enables calibration.
+- ~~**Saleae Logic Pro 8 automation**~~ — Python API integration for synchronized digital+analog capture and analysis.
 
 **Guiding principle**: Jitter and timing budget compliance come first. Mode A (PIO + noInterrupts) is the production architecture.
 
@@ -196,6 +209,8 @@ Modes B (DMA) and C (MSM/DMA) are ~1.3 µs faster but introduce jitter from DMA 
 - `test_firmware/single_led/bcm_jitter_sweep.py` — BCM jitter sweep (4 T × 16 intensities × 10k frames)
 - `test_firmware/single_led/run_tests.py` — automated serial test harness (legacy)
 - `test_firmware/single_led/visual_test.py` — interactive visual verification
+- `test_firmware/single_led/saleae_capture.py` — Saleae Logic 2 automation + analysis
+- `test_firmware/single_led/PCB_REDESIGN_ANALYSIS.md` — PCB pin assignment analysis and redesign options
 
 ## Serial Commands (current firmware)
 
@@ -207,5 +222,6 @@ Multi-SM PIO: `MSMSCAN n`, `MSMTEST`
 Burst mode (2P sync sim): `BURST n [rate_hz]` — default 8 kHz trigger rate, `noInterrupts()` during scan burst
 BCM burst (Phase 4): `BCM bits`, `BCMON us`, `FILL intensity`, `GRADIENT`, `BCMBURST n [Hz] [A|B|C]`, `BCMDEMO`
 RAM burst (Phase 5a): `RAMBURST n [Hz] [n_frames] [P]` — frame cycling from RAM, P=pre-emptive noInterrupts
+External trigger (Phase 6): `EXTTRIG ON|OFF`, `TRIGTEST [N]`, `PHOTOCAL [hold_sec]`, `BCMWEIGHTS w0 w1 ...`
 System: `REBOOT` (enters BOOTSEL mode for flashing)
 `HELP` for full list.

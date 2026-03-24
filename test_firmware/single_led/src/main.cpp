@@ -209,6 +209,8 @@ static uint64_t all_col_mask;              // mask of ALL column pins
 // BCM state (Phase 4)
 static uint8_t  bcm_bits = 4;                            // N-bit BCM (3-8)
 static float    bcm_base_on_us = 0.5f;                   // base time unit T (µs)
+static float    bcm_weight[8] = {1,2,4,8,16,32,64,128};  // bit-plane weights (default: powers of 2)
+static bool     bcm_custom_weights = false;               // true if user set custom weights
 static uint8_t  pixel_data[PANEL_SIZE][PANEL_SIZE];       // intensity per pixel
 static uint32_t bcm_plane_data[PANEL_SIZE][8][2];         // [row][bit] = {pio_pattern, pio_delay}
 
@@ -286,10 +288,10 @@ static void precompute_scan_masks() {
 static void precompute_bcm_data() {
     uint32_t base_cycles = (uint32_t)(bcm_base_on_us * cycles_per_us);
 
-    // Precompute delays (same for all rows; vary per bit-plane only)
+    // Precompute delays using weights (custom or default power-of-2)
     uint32_t pio_delays[8];
     for (int b = 0; b < bcm_bits; b++) {
-        uint32_t on_cycles_b = base_cycles * (1U << b);
+        uint32_t on_cycles_b = (uint32_t)(base_cycles * bcm_weight[b]);
         pio_delays[b] = (on_cycles_b > PIO_ON_OVERHEAD_CYCLES)
                       ? (on_cycles_b - PIO_ON_OVERHEAD_CYCLES) : 0;
     }
@@ -324,9 +326,9 @@ static void precompute_bcm_data() {
 static void precompute_bcm_row(uint8_t sch_row) {
     uint32_t base_cycles = (uint32_t)(bcm_base_on_us * cycles_per_us);
 
-    // Init this row's planes to all-OFF
+    // Init this row's planes to all-OFF (using weights)
     for (int b = 0; b < bcm_bits; b++) {
-        uint32_t on_cycles_b = base_cycles * (1U << b);
+        uint32_t on_cycles_b = (uint32_t)(base_cycles * bcm_weight[b]);
         bcm_plane_data[sch_row][b][0] = 0xFFFFF;
         bcm_plane_data[sch_row][b][1] = (on_cycles_b > PIO_ON_OVERHEAD_CYCLES)
                                        ? (on_cycles_b - PIO_ON_OVERHEAD_CYCLES) : 0;
@@ -1882,7 +1884,7 @@ static void __attribute__((noinline)) __not_in_flash_func(run_bcm_burst_pio)(
     uint32_t base_cycles = (uint32_t)(bcm_base_on_us * cycles_per_us);
     uint32_t nominal_burst_cyc = 0;
     for (int b = 0; b < bcm_bits; b++) {
-        uint32_t on_cyc_b = base_cycles * (1U << b);
+        uint32_t on_cyc_b = (uint32_t)(base_cycles * bcm_weight[b]);
         nominal_burst_cyc += on_cyc_b + PIO_ON_OVERHEAD_CYCLES + 50; // ~50 cyc CPU overhead per pass
     }
     stat_outlier_threshold = nominal_burst_cyc * 2;
@@ -2008,7 +2010,7 @@ static void __attribute__((noinline)) __not_in_flash_func(run_bcm_burst_dma)(
     uint32_t base_cycles = (uint32_t)(bcm_base_on_us * cycles_per_us);
     uint32_t nominal_burst_cyc = 0;
     for (int b = 0; b < bcm_bits; b++) {
-        nominal_burst_cyc += base_cycles * (1U << b) + PIO_ON_OVERHEAD_CYCLES + 30;
+        nominal_burst_cyc += (uint32_t)(base_cycles * bcm_weight[b]) + PIO_ON_OVERHEAD_CYCLES + 30;
     }
     stat_outlier_threshold = nominal_burst_cyc * 2;
 
@@ -2116,7 +2118,7 @@ static void __attribute__((noinline)) __not_in_flash_func(run_bcm_burst_msm)(
     uint32_t base_cycles = (uint32_t)(bcm_base_on_us * cycles_per_us);
     uint32_t nominal_burst_cyc = 0;
     for (int b = 0; b < bcm_bits; b++) {
-        nominal_burst_cyc += base_cycles * (1U << b) + PIO_ON_OVERHEAD_CYCLES + 30;
+        nominal_burst_cyc += (uint32_t)(base_cycles * bcm_weight[b]) + PIO_ON_OVERHEAD_CYCLES + 30;
     }
     stat_outlier_threshold = nominal_burst_cyc * 2;
 
@@ -2331,6 +2333,66 @@ static void cmd_bcmon(const char* arg) {
     Serial.println("us");
 }
 
+static void cmd_bcmweights(const char* arg) {
+    if (!arg || !*arg || strcmp(arg, "DEFAULT") == 0 || strcmp(arg, "RESET") == 0) {
+        // Reset to default power-of-2 weights
+        for (int b = 0; b < 8; b++) bcm_weight[b] = (float)(1U << b);
+        bcm_custom_weights = false;
+        Serial.println("BCM weights reset to default (1,2,4,8,...)");
+    } else {
+        // Parse up to bcm_bits float weights
+        float w[8];
+        int n = 0;
+        const char* p = arg;
+        while (n < bcm_bits && *p) {
+            while (*p == ' ' || *p == ',') p++;
+            if (!*p) break;
+            char* end;
+            w[n] = strtof(p, &end);
+            if (end == p || w[n] <= 0 || w[n] > 1000) {
+                Serial.print("ERR: Invalid weight '");
+                Serial.print(p);
+                Serial.println("'. Use positive floats, e.g. BCMWEIGHTS 1.2 2.2 4.1 8.0");
+                return;
+            }
+            p = end;
+            n++;
+        }
+        if (n != bcm_bits) {
+            Serial.print("ERR: Need ");
+            Serial.print(bcm_bits);
+            Serial.print(" weights, got ");
+            Serial.println(n);
+            return;
+        }
+        for (int b = 0; b < bcm_bits; b++) bcm_weight[b] = w[b];
+        bcm_custom_weights = true;
+    }
+    Serial.print("BCM weights (");
+    Serial.print(bcm_bits);
+    Serial.print(" bits): ");
+    for (int b = 0; b < bcm_bits; b++) {
+        Serial.print(bcm_weight[b], 3);
+        if (b < bcm_bits - 1) Serial.print(", ");
+    }
+    Serial.println(bcm_custom_weights ? "  [CUSTOM]" : "  [DEFAULT]");
+
+    // Show actual ON times
+    Serial.print("  ON times (T=");
+    Serial.print(bcm_base_on_us, 3);
+    Serial.print("us): ");
+    float total = 0;
+    for (int b = 0; b < bcm_bits; b++) {
+        float t = bcm_base_on_us * bcm_weight[b];
+        total += t;
+        Serial.print(t, 3);
+        if (b < bcm_bits - 1) Serial.print(", ");
+    }
+    Serial.print("  Total=");
+    Serial.print(total, 3);
+    Serial.println("us");
+}
+
 static void cmd_fill(const char* arg) {
     int val = atoi(arg);
     int max_val = (1 << bcm_bits) - 1;
@@ -2376,7 +2438,7 @@ static void cmd_bcmdemo() {
     uint32_t base_cycles = (uint32_t)(bcm_base_on_us * cycles_per_us);
     uint32_t nominal_burst_cyc = 0;
     for (int b = 0; b < bcm_bits; b++) {
-        nominal_burst_cyc += base_cycles * (1U << b) + PIO_ON_OVERHEAD_CYCLES + 50;
+        nominal_burst_cyc += (uint32_t)(base_cycles * bcm_weight[b]) + PIO_ON_OVERHEAD_CYCLES + 50;
     }
 
     Serial.println("--- BCMDEMO START ---");
@@ -2516,7 +2578,7 @@ static void __attribute__((noinline)) __not_in_flash_func(run_bcm_visual_level)(
     uint32_t base_cycles = (uint32_t)(bcm_base_on_us * cycles_per_us);
     uint32_t nominal_burst_cyc = 0;
     for (int b = 0; b < bcm_bits; b++) {
-        nominal_burst_cyc += base_cycles * (1U << b) + PIO_ON_OVERHEAD_CYCLES + 50;
+        nominal_burst_cyc += (uint32_t)(base_cycles * bcm_weight[b]) + PIO_ON_OVERHEAD_CYCLES + 50;
     }
     stat_outlier_threshold = nominal_burst_cyc * 2;
 
@@ -2767,7 +2829,7 @@ static void __attribute__((noinline)) __not_in_flash_func(run_ramburst)(
     uint32_t base_cycles = (uint32_t)(bcm_base_on_us * cycles_per_us);
     uint32_t nominal_burst_cyc = 0;
     for (int b = 0; b < bcm_bits; b++) {
-        nominal_burst_cyc += base_cycles * (1U << b) + PIO_ON_OVERHEAD_CYCLES + 50;
+        nominal_burst_cyc += (uint32_t)(base_cycles * bcm_weight[b]) + PIO_ON_OVERHEAD_CYCLES + 50;
     }
     stat_outlier_threshold = nominal_burst_cyc * 2;
 
@@ -3159,7 +3221,7 @@ static void cmd_photocal(const char* arg) {
     uint32_t base_cycles = (uint32_t)(bcm_base_on_us * cycles_per_us);
     uint32_t nominal_burst_cyc = 0;
     for (int b = 0; b < bcm_bits; b++) {
-        nominal_burst_cyc += base_cycles * (1U << b) + PIO_ON_OVERHEAD_CYCLES + 50;
+        nominal_burst_cyc += (uint32_t)(base_cycles * bcm_weight[b]) + PIO_ON_OVERHEAD_CYCLES + 50;
     }
 
     for (int level = 0; level < (1 << bcm_bits); level++) {
@@ -3648,6 +3710,8 @@ static void cmd_help() {
     Serial.println("== BCM Burst Mode (Phase 4) ==");
     Serial.println("BCM <bits>       Set BCM bit depth (1-8, default 4)");
     Serial.println("BCMON <us>       Set BCM base time T (default 0.5 us)");
+    Serial.println("BCMWEIGHTS w0 w1 ..  Set custom bit-plane weights (e.g. 1.2 2.2 4.1 8)");
+    Serial.println("BCMWEIGHTS RESET     Reset to default power-of-2 weights");
     Serial.println("FILL <intensity> Fill all pixels with value");
     Serial.println("GRADIENT         Row-varying intensity gradient");
     Serial.println("BCMBURST <N> [Hz] [A|B|C]  BCM burst scan");
@@ -4281,6 +4345,8 @@ static void process_command() {
         cmd_bcm_set(args);
     } else if (strcmp(cmd_buf, "BCMON") == 0 && args) {
         cmd_bcmon(args);
+    } else if (strcmp(cmd_buf, "BCMWEIGHTS") == 0) {
+        cmd_bcmweights(args);
     } else if (strcmp(cmd_buf, "FILL") == 0 && args) {
         cmd_fill(args);
     } else if (strcmp(cmd_buf, "GRADIENT") == 0) {
