@@ -111,7 +111,7 @@ python3 test_firmware/single_led/auto_test.py cmd "BURST 10000"
 - **Phase 3e**: Burst-mode scanning — simulated 8 kHz trigger, `noInterrupts()` during scan burst. Confirmed zero jitter (0.000 µs) for PIOSCAN burst mode.
 - **Phase 4**: BCM grayscale — single-row-per-trigger BCM with 3 modes (PIO/DMA/MSM). **Zero jitter achieved** with multicore lockout + noInterrupts + noinline + warm-up. Full sweep: 640k measurements, all showing 0.007 µs jitter (1 cycle), 0 outliers. 4-bit BCM at T=0.5 µs: 9.49 µs burst, fits 15 µs with 5.5 µs margin. 400 Hz frame rate. Visually verified (BCMDEMO ramp test).
 - **Phase 5a**: RAMBURST — production-realistic frame loading. 8 test frames cycling at 400 Hz from RAM, incremental per-row precompute (38 µs/row during 115 µs idle). **0.007 µs jitter** with frame swaps happening. Critical `noinline` bug found and fixed: compiler was silently inlining `__not_in_flash_func` into flash callers.
-- **Phase 6**: External trigger + optical characterization — GP45 external trigger (bodge wire), zero jitter confirmed with real 8 kHz waveform generator. PHOTOCAL command cycles 16 BCM levels. Saleae Logic Pro 8 automation via Python API. Pulse-triggered averaging resolves BCM bit-plane structure (B0-B3 at 1:2:4:8 ratio) in photodiode signal. BCMWEIGHTS command for custom bit-plane weights (6.67 ns resolution) to enable linearity calibration.
+- **Phase 6**: External trigger + optical characterization — GP45 external trigger (bodge wire), zero jitter confirmed with real 8 kHz waveform generator. PHOTOCAL command cycles 16 BCM levels. Saleae Logic Pro 8 automation via Python API. Pulse-triggered averaging resolves BCM bit-plane structure (B0-B3 at 1:2:4:8 ratio) in photodiode signal. BCMWEIGHTS command for custom bit-plane weights (6.67 ns resolution) to enable linearity calibration. Ocean Insight Flame X spectrometer: LED peak at 570.8 nm. Spectrometer linearity measurement: 16 BCM levels, 50 ms integration, 20 nm window (560-580 nm). Key finding: brightness-per-microsecond decreases with longer bit-planes (B0=3163 cts/us to B3=2024 cts/us, 56% drop). BCMWEIGHTS optimizer converged to [1, 2, 5.02, 10.19] at T=0.7 us: monotonic, 2.5% max error, 12.7 us burst fits 15 us window. BCMORDER REVERSE command added to test if bit-plane scan order affects brightness.
 
 ## Key Technical Findings
 
@@ -166,7 +166,7 @@ Modes B (DMA) and C (MSM/DMA) are ~1.3 µs faster but introduce jitter from DMA 
 BCMBURST 10000 with real 8 kHz external trigger on GP45: 0.000 µs jitter, 9.507 µs burst. Per-burst noInterrupts + Core 1 lockout + warm-up achieves zero jitter even with external trigger.
 
 ### BCM bit-plane weights are fully configurable
-`BCMWEIGHTS` command accepts arbitrary float weights (e.g., 1.2, 2.2, 4.1, 8.0) with 6.67 ns resolution (1 CPU cycle at 150 MHz). Enables linearization of LED output by adjusting bit-plane durations based on measured response curves.
+`BCMWEIGHTS` command accepts arbitrary float weights (e.g., 1.2, 2.2, 4.1, 8.0) with 6.67 ns resolution (1 CPU cycle at 150 MHz). `BCMORDER REVERSE`/`NORMAL` toggles scan direction (B3->B0 vs B0->B3). Linearity optimizer (`bcm_weight_optimizer.py`) iteratively adjusts weights using spectrometer feedback. Default [1,2,4,8] weights are non-monotonic at T<=0.7 us due to per-bit-plane brightness decay (B0=3163 cts/us to B3=2024 cts/us). Optimized weights [1, 2, 5.02, 10.19] at T=0.7 us achieve monotonic linear response with 2.5% max error.
 
 ### Saleae Logic Pro 8 integration
 Python automation via `saleae_capture.py` using Logic 2 API. Captures digital trigger + analog photodiode simultaneously. Pulse-triggered averaging across 499 pulses at 50 MHz resolves individual BCM bit-planes and ~0.4 µs PIO overhead gaps.
@@ -174,9 +174,10 @@ Python automation via `saleae_capture.py` using Logic 2 API. Captures digital tr
 ## Next Steps
 
 ### Immediate
-1. **Optical linearity characterization** — Use Ocean Optics spectrometer with integration time averaging for calibrated BCM linearity measurement. Sweep T x intensity to build 2D response map. Calibrate BCMWEIGHTS for linearized output.
-2. **Probe LED pin (GP1) on Saleae** — Measure trigger-to-LED latency and confirm bit-plane timing directly on column driver pin (eliminates photodiode bandwidth uncertainty).
-3. **PCB redesign** — See PCB_REDESIGN_ANALYSIS.md. Option B (add EINT trace to GP45) recommended for next revision.
+1. **Test BCMORDER REVERSE** — Determine if bit-plane scan order (B3->B0 vs B0->B3) affects per-bit-plane brightness decay. Re-run optimizer with reverse order to see if linearity improves.
+2. **Update PowerPoint slides** — Add linearity comparison (default vs optimized weights, forward vs reverse order) to summary presentation.
+3. **Probe LED pin (GP1) on Saleae** — Measure trigger-to-LED latency and confirm bit-plane timing directly on column driver pin (eliminates photodiode bandwidth uncertainty).
+4. **PCB redesign** — See PCB_REDESIGN_ANALYSIS.md. Option B (add EINT trace to GP45) recommended for next revision.
 
 ### After optical calibration
 - **Per-pixel pattern loading** — USB or SPI interface for host to send pixel_data[20][20] frames
@@ -192,6 +193,7 @@ Python automation via `saleae_capture.py` using Logic 2 API. Captures digital tr
 - ~~**External trigger interface**~~ — Implemented (Phase 6). GP45 bodge wire, real 8 kHz waveform generator. Zero jitter confirmed with external trigger.
 - ~~**Optical characterization (initial)**~~ — Photodiode + Saleae pulse-triggered averaging resolves BCM bit-planes. BCMWEIGHTS enables calibration.
 - ~~**Saleae Logic Pro 8 automation**~~ — Python API integration for synchronized digital+analog capture and analysis.
+- ~~**Spectrometer linearity characterization**~~ — Ocean Insight Flame X (570.8 nm peak, 50 ms integration, 560-580 nm window). Per-bit-plane brightness decay measured (B0=3163 cts/us to B3=2024 cts/us). BCMWEIGHTS optimizer converged to [1, 2, 5.02, 10.19] at T=0.7 us for monotonic response (2.5% max error, 12.7 us burst).
 
 **Guiding principle**: Jitter and timing budget compliance come first. Mode A (PIO + noInterrupts) is the production architecture.
 
@@ -210,6 +212,8 @@ Python automation via `saleae_capture.py` using Logic 2 API. Captures digital tr
 - `test_firmware/single_led/run_tests.py` — automated serial test harness (legacy)
 - `test_firmware/single_led/visual_test.py` — interactive visual verification
 - `test_firmware/single_led/saleae_capture.py` — Saleae Logic 2 automation + analysis
+- `test_firmware/single_led/spectrometer_cal.py` — Ocean Insight Flame X spectrometer calibration and linearity measurement
+- `test_firmware/single_led/bcm_weight_optimizer.py` — iterative BCM weight optimizer using spectrometer feedback
 - `test_firmware/single_led/PCB_REDESIGN_ANALYSIS.md` — PCB pin assignment analysis and redesign options
 
 ## Serial Commands (current firmware)
@@ -222,6 +226,6 @@ Multi-SM PIO: `MSMSCAN n`, `MSMTEST`
 Burst mode (2P sync sim): `BURST n [rate_hz]` — default 8 kHz trigger rate, `noInterrupts()` during scan burst
 BCM burst (Phase 4): `BCM bits`, `BCMON us`, `FILL intensity`, `GRADIENT`, `BCMBURST n [Hz] [A|B|C]`, `BCMDEMO`
 RAM burst (Phase 5a): `RAMBURST n [Hz] [n_frames] [P]` — frame cycling from RAM, P=pre-emptive noInterrupts
-External trigger (Phase 6): `EXTTRIG ON|OFF`, `TRIGTEST [N]`, `PHOTOCAL [hold_sec]`, `BCMWEIGHTS w0 w1 ...`
+External trigger (Phase 6): `EXTTRIG ON|OFF`, `TRIGTEST [N]`, `PHOTOCAL [hold_sec]`, `BCMWEIGHTS w0 w1 ...`, `BCMORDER REV|FWD`
 System: `REBOOT` (enters BOOTSEL mode for flashing)
 `HELP` for full list.
