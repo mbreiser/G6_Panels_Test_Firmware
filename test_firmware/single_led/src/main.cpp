@@ -211,8 +211,14 @@ static uint8_t  bcm_bits = 4;                            // N-bit BCM (3-8)
 static float    bcm_base_on_us = 0.5f;                   // base time unit T (µs)
 static float    bcm_weight[8] = {1,2,4,8,16,32,64,128};  // bit-plane weights (default: powers of 2)
 static bool     bcm_custom_weights = false;               // true if user set custom weights
+static bool     bcm_reverse_order = false;                // true = B3,B2,B1,B0 instead of B0,B1,B2,B3
 static uint8_t  pixel_data[PANEL_SIZE][PANEL_SIZE];       // intensity per pixel
 static uint32_t bcm_plane_data[PANEL_SIZE][8][2];         // [row][bit] = {pio_pattern, pio_delay}
+
+// Helper: map iteration index to bit-plane index (supports reverse order)
+static inline int bcm_bit(int i) {
+    return bcm_reverse_order ? (bcm_bits - 1 - i) : i;
+}
 
 // External trigger state (Phase 6)
 static enum { TRIG_DWT, TRIG_EXT } trig_mode = TRIG_DWT;
@@ -1905,8 +1911,8 @@ static void __attribute__((noinline)) __not_in_flash_func(run_bcm_burst_pio)(
     noInterrupts();
     gpio_set_mask64(row_on_mask[0]);
     for (int b = 0; b < bcm_bits; b++) {
-        pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, bcm_plane_data[0][b][0]);
-        pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, bcm_plane_data[0][b][1]);
+        pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, bcm_plane_data[0][bcm_bit(b)][0]);
+        pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, bcm_plane_data[0][bcm_bit(b)][1]);
         while (!pio_interrupt_get(pio_hw_inst, 0)) {}
         pio_interrupt_clear(pio_hw_inst, 0);
     }
@@ -1927,8 +1933,8 @@ static void __attribute__((noinline)) __not_in_flash_func(run_bcm_burst_pio)(
             wu_start += trigger_period_cyc;
             gpio_set_mask64(row_on_mask[wr]);
             for (int b = 0; b < bcm_bits; b++) {
-                pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, bcm_plane_data[wr][b][0]);
-                pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, bcm_plane_data[wr][b][1]);
+                pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, bcm_plane_data[wr][bcm_bit(b)][0]);
+                pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, bcm_plane_data[wr][bcm_bit(b)][1]);
                 while (!pio_interrupt_get(pio_hw_inst, 0)) {}
                 pio_interrupt_clear(pio_hw_inst, 0);
             }
@@ -1961,8 +1967,8 @@ static void __attribute__((noinline)) __not_in_flash_func(run_bcm_burst_pio)(
 
         gpio_set_mask64(row_on_mask[row]);
         for (int b = 0; b < bcm_bits; b++) {
-            pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, bcm_plane_data[row][b][0]);
-            pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, bcm_plane_data[row][b][1]);
+            pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, bcm_plane_data[row][bcm_bit(b)][0]);
+            pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, bcm_plane_data[row][bcm_bit(b)][1]);
             while (!pio_interrupt_get(pio_hw_inst, 0)) {}
             pio_interrupt_clear(pio_hw_inst, 0);
         }
@@ -2041,8 +2047,8 @@ static void __attribute__((noinline)) __not_in_flash_func(run_bcm_burst_dma)(
     noInterrupts();
     gpio_set_mask64(row_on_mask[0]);
     for (int b = 0; b < bcm_bits; b++) {
-        pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, bcm_plane_data[0][b][0]);
-        pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, bcm_plane_data[0][b][1]);
+        pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, bcm_plane_data[0][bcm_bit(b)][0]);
+        pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, bcm_plane_data[0][bcm_bit(b)][1]);
         while (!pio_interrupt_get(pio_hw_inst, 0)) {}
         pio_interrupt_clear(pio_hw_inst, 0);
     }
@@ -2393,6 +2399,29 @@ static void cmd_bcmweights(const char* arg) {
     Serial.println("us");
 }
 
+static void cmd_bcmorder(const char* arg) {
+    if (arg && *arg) {
+        if (strcmp(arg, "REVERSE") == 0 || strcmp(arg, "REV") == 0 || strcmp(arg, "R") == 0) {
+            bcm_reverse_order = true;
+        } else if (strcmp(arg, "NORMAL") == 0 || strcmp(arg, "FWD") == 0 || strcmp(arg, "F") == 0) {
+            bcm_reverse_order = false;
+        } else {
+            Serial.println("ERR: BCMORDER REVERSE|NORMAL");
+            return;
+        }
+    }
+    Serial.print("BCM bit-plane order: ");
+    if (bcm_reverse_order) {
+        Serial.print("REVERSE (B");
+        Serial.print(bcm_bits - 1);
+        Serial.println("→B0: longest first)");
+    } else {
+        Serial.print("NORMAL (B0→B");
+        Serial.print(bcm_bits - 1);
+        Serial.println(": shortest first)");
+    }
+}
+
 static void cmd_fill(const char* arg) {
     int val = atoi(arg);
     int max_val = (1 << bcm_bits) - 1;
@@ -2472,8 +2501,8 @@ static void cmd_bcmdemo() {
     noInterrupts();
     gpio_set_mask64(row_on_mask[0]);
     for (int b = 0; b < bcm_bits; b++) {
-        pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, bcm_plane_data[0][b][0]);
-        pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, bcm_plane_data[0][b][1]);
+        pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, bcm_plane_data[0][bcm_bit(b)][0]);
+        pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, bcm_plane_data[0][bcm_bit(b)][1]);
         while (!pio_interrupt_get(pio_hw_inst, 0)) {}
         pio_interrupt_clear(pio_hw_inst, 0);
     }
@@ -2508,8 +2537,8 @@ static void cmd_bcmdemo() {
 
                 gpio_set_mask64(row_on_mask[r]);
                 for (int b = 0; b < bcm_bits; b++) {
-                    pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, bcm_plane_data[r][b][0]);
-                    pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, bcm_plane_data[r][b][1]);
+                    pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, bcm_plane_data[r][bcm_bit(b)][0]);
+                    pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, bcm_plane_data[r][bcm_bit(b)][1]);
                     while (!pio_interrupt_get(pio_hw_inst, 0)) {}
                     pio_interrupt_clear(pio_hw_inst, 0);
                 }
@@ -2597,8 +2626,8 @@ static void __attribute__((noinline)) __not_in_flash_func(run_bcm_visual_level)(
             wu_start += trigger_period_cyc;
             gpio_set_mask64(row_on_mask[wr]);
             for (int b = 0; b < bcm_bits; b++) {
-                pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, bcm_plane_data[wr][b][0]);
-                pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, bcm_plane_data[wr][b][1]);
+                pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, bcm_plane_data[wr][bcm_bit(b)][0]);
+                pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, bcm_plane_data[wr][bcm_bit(b)][1]);
                 while (!pio_interrupt_get(pio_hw_inst, 0)) {}
                 pio_interrupt_clear(pio_hw_inst, 0);
             }
@@ -2642,8 +2671,8 @@ static void __attribute__((noinline)) __not_in_flash_func(run_bcm_visual_level)(
 
         gpio_set_mask64(row_on_mask[row]);
         for (int b = 0; b < bcm_bits; b++) {
-            pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, bcm_plane_data[row][b][0]);
-            pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, bcm_plane_data[row][b][1]);
+            pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, bcm_plane_data[row][bcm_bit(b)][0]);
+            pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, bcm_plane_data[row][bcm_bit(b)][1]);
             while (!pio_interrupt_get(pio_hw_inst, 0)) {}
             pio_interrupt_clear(pio_hw_inst, 0);
         }
@@ -2866,8 +2895,8 @@ static void __attribute__((noinline)) __not_in_flash_func(run_ramburst)(
             wu_start += trigger_period_cyc;
             gpio_set_mask64(row_on_mask[wr]);
             for (int b = 0; b < bcm_bits; b++) {
-                pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, bcm_plane_data[wr][b][0]);
-                pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, bcm_plane_data[wr][b][1]);
+                pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, bcm_plane_data[wr][bcm_bit(b)][0]);
+                pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, bcm_plane_data[wr][bcm_bit(b)][1]);
                 while (!pio_interrupt_get(pio_hw_inst, 0)) {}
                 pio_interrupt_clear(pio_hw_inst, 0);
             }
@@ -2936,8 +2965,8 @@ static void __attribute__((noinline)) __not_in_flash_func(run_ramburst)(
 
         gpio_set_mask64(row_on_mask[row]);
         for (int b = 0; b < bcm_bits; b++) {
-            pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, bcm_plane_data[row][b][0]);
-            pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, bcm_plane_data[row][b][1]);
+            pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, bcm_plane_data[row][bcm_bit(b)][0]);
+            pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, bcm_plane_data[row][bcm_bit(b)][1]);
             while (!pio_interrupt_get(pio_hw_inst, 0)) {}
             pio_interrupt_clear(pio_hw_inst, 0);
         }
@@ -3161,7 +3190,7 @@ static void cmd_photocal(const char* arg) {
     // PHOTOCAL [hold_sec] [row] — cycle 16 BCM levels with gaps for Saleae parsing
     // row = which single row to light (-1 = all rows, default = 0)
     float hold_sec = 3.0f;
-    int cal_row = 0;  // default: row 0 only
+    int cal_row = -1;  // default: ALL rows (full panel for optical characterization)
     if (arg && *arg) {
         char* end;
         hold_sec = strtof(arg, &end);
@@ -3246,8 +3275,8 @@ static void cmd_photocal(const char* arg) {
             warmup_start += trigger_period_cyc;
             gpio_set_mask64(row_on_mask[warmup_row]);
             for (int b = 0; b < bcm_bits; b++) {
-                pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, bcm_plane_data[warmup_row][b][0]);
-                pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, bcm_plane_data[warmup_row][b][1]);
+                pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, bcm_plane_data[warmup_row][bcm_bit(b)][0]);
+                pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, bcm_plane_data[warmup_row][bcm_bit(b)][1]);
                 while (!pio_interrupt_get(pio_hw_inst, 0)) {}
                 pio_interrupt_clear(pio_hw_inst, 0);
             }
@@ -3257,42 +3286,37 @@ static void cmd_photocal(const char* arg) {
         }
         interrupts();
 
-        // Main measurement loop — per-burst noInterrupts
-        uint32_t trigger_start = m33_hw->dwt_cyccnt;
-        uint8_t row = 0;
+        // Main measurement loop — free-running, ALL rows per frame
+        // This maximizes LED duty cycle for optical characterization.
+        // Each frame scans all active_rows sequentially.
+        uint32_t frame_count = 0;
+        uint32_t target_frames = (uint32_t)(hold_sec * rate / active_rows);
         bool timeout = false;
 
-        for (uint32_t t = 0; t < triggers_per_level; t++) {
-            if (!wait_for_trigger(&trigger_start, trigger_period_cyc)) {
-                Serial.print("  TIMEOUT at level ");
-                Serial.print(level);
-                Serial.print(" trigger ");
-                Serial.println(t);
-                timeout = true;
-                break;
-            }
+        uint32_t loop_start = m33_hw->dwt_cyccnt;
+        uint32_t hold_cyc = (uint32_t)(hold_sec * cycles_per_us * 1000000.0f);
 
+        while ((m33_hw->dwt_cyccnt - loop_start) < hold_cyc) {
+            // Scan ALL rows — one complete frame
             noInterrupts();
-            uint32_t burst_start = m33_hw->dwt_cyccnt;
-            gpio_set_mask64(row_on_mask[row]);
-            for (int b = 0; b < bcm_bits; b++) {
-                pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, bcm_plane_data[row][b][0]);
-                pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, bcm_plane_data[row][b][1]);
-                while (!pio_interrupt_get(pio_hw_inst, 0)) {}
-                pio_interrupt_clear(pio_hw_inst, 0);
+            uint32_t frame_start = m33_hw->dwt_cyccnt;
+            for (uint8_t row = 0; row < active_rows; row++) {
+                gpio_set_mask64(row_on_mask[row]);
+                for (int b = 0; b < bcm_bits; b++) {
+                    pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, bcm_plane_data[row][bcm_bit(b)][0]);
+                    pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, bcm_plane_data[row][bcm_bit(b)][1]);
+                    while (!pio_interrupt_get(pio_hw_inst, 0)) {}
+                    pio_interrupt_clear(pio_hw_inst, 0);
+                }
+                gpio_clr_mask64(row_on_mask[row]);
             }
-            gpio_clr_mask64(row_on_mask[row]);
-            uint32_t burst_end = m33_hw->dwt_cyccnt;
+            uint32_t frame_end = m33_hw->dwt_cyccnt;
             interrupts();
 
-            stats_update(burst_end - burst_start, 0);
-            row++;
-            if (row >= active_rows) row = 0;
+            stats_update(frame_end - frame_start, 0);
+            frame_count++;
 
-            if ((t % 1000 == 999) && user_wants_stop()) {
-                Serial.print("  (interrupted at trigger ");
-                Serial.print(t + 1);
-                Serial.println(")");
+            if ((frame_count % 500 == 499) && user_wants_stop()) {
                 break;
             }
         }
@@ -3318,23 +3342,13 @@ static void cmd_photocal(const char* arg) {
 
         if (timeout) break;
 
-        // Gap: all-OFF for gap_sec seconds (makes Saleae segmentation trivial)
-        memset(pixel_data, 0, sizeof(pixel_data));
-        precompute_bcm_data();
-        for (uint32_t g = 0; g < gap_triggers; g++) {
-            if (!wait_for_trigger(&trigger_start, trigger_period_cyc)) break;
-            noInterrupts();
-            gpio_set_mask64(row_on_mask[row]);
-            for (int b = 0; b < bcm_bits; b++) {
-                pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, bcm_plane_data[row][b][0]);
-                pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, bcm_plane_data[row][b][1]);
-                while (!pio_interrupt_get(pio_hw_inst, 0)) {}
-                pio_interrupt_clear(pio_hw_inst, 0);
-            }
-            gpio_clr_mask64(row_on_mask[row]);
-            interrupts();
-            row++;
-            if (row >= active_rows) row = 0;
+        // Gap: all-OFF for gap_sec seconds (LEDs dark, spectrometer reads baseline)
+        all_off();
+        uint32_t gap_start = m33_hw->dwt_cyccnt;
+        uint32_t gap_cyc = (uint32_t)(gap_sec * cycles_per_us * 1000000.0f);
+        while ((m33_hw->dwt_cyccnt - gap_start) < gap_cyc) {
+            delay(10);  // idle, let USB run
+            if (user_wants_stop()) { timeout = true; break; }
         }
     }
 
@@ -3711,6 +3725,7 @@ static void cmd_help() {
     Serial.println("BCM <bits>       Set BCM bit depth (1-8, default 4)");
     Serial.println("BCMON <us>       Set BCM base time T (default 0.5 us)");
     Serial.println("BCMWEIGHTS w0 w1 ..  Set custom bit-plane weights (e.g. 1.2 2.2 4.1 8)");
+    Serial.println("BCMORDER REV|FWD    Bit-plane scan order: REV=B3→B0, FWD=B0→B3");
     Serial.println("BCMWEIGHTS RESET     Reset to default power-of-2 weights");
     Serial.println("FILL <intensity> Fill all pixels with value");
     Serial.println("GRADIENT         Row-varying intensity gradient");
@@ -4347,6 +4362,8 @@ static void process_command() {
         cmd_bcmon(args);
     } else if (strcmp(cmd_buf, "BCMWEIGHTS") == 0) {
         cmd_bcmweights(args);
+    } else if (strcmp(cmd_buf, "BCMORDER") == 0) {
+        cmd_bcmorder(args);
     } else if (strcmp(cmd_buf, "FILL") == 0 && args) {
         cmd_fill(args);
     } else if (strcmp(cmd_buf, "GRADIENT") == 0) {

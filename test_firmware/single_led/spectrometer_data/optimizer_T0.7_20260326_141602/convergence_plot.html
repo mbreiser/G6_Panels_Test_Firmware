@@ -1,0 +1,93 @@
+<!DOCTYPE html>
+<html><head><title>BCM Weight Optimizer — Convergence</title>
+<style>
+body { font-family: monospace; background: #1a1a2e; color: #e0e0e0; margin: 20px; }
+h2 { color: #00d4ff; }
+canvas { border: 1px solid #444; background: #0d0d1a; display: block; margin: 5px 0 15px 0; }
+.stats { background: #222; padding: 10px; border-radius: 5px; margin: 10px 0; }
+</style></head><body>
+<h2>BCM Weight Optimizer — Linearity Convergence</h2>
+<canvas id="conv" width="800" height="400"></canvas>
+<pre id="summary" style="font-size:12px;"></pre>
+<script>
+const results = [{"iteration": 0, "weights": [1.0, 2.0, 4.0, 8.0], "monotonic": false, "max_error_pct": 6.651433101772152, "level_signals": [0.0, 2214.2458333333334, 3707.3564716312057, 5890.6208333333325, 5903.152216312057, 8057.918749999999, 9509.522916666667, 11627.030939716313, 11332.135416666666, 13425.664583333333, 14826.449999999999, 16882.75221631206, 16829.984131205674, 18849.831250000003, 20173.09264184397, 22102.45434397163]}, {"iteration": 1, "weights": [1.0, 2.0, 4.0, 8.69], "monotonic": false, "max_error_pct": 5.430323044901014, "level_signals": [0.0, 2072.864583333334, 3504.4714095744685, 5547.595833333334, 5566.716666666666, 7592.558643617021, 8995.077083333334, 10990.7625, 11600.122916666667, 13571.483333333334, 14900.813962765958, 16821.608333333334, 16805.395833333332, 18705.090558510637, 19984.149999999998, 21814.885416666664]}, {"iteration": 2, "weights": [1.0, 2.0, 4.658, 8.69], "monotonic": false, "max_error_pct": 5.489216646327677, "level_signals": [0.0, 1970.4083333333328, 3335.9439273049647, 5290.50350177305, 6127.156693262412, 8052.6875, 9387.508333333333, 11282.582225177304, 11055.30625, 12927.570833333335, 14214.388608156027, 16057.329166666666, 16834.35208333333, 18648.241666666665, 19863.727083333335, 21632.424778368793]}, {"iteration": 3, "weights": [1.0, 2.0, 4.658, 9.413], "monotonic": true, "max_error_pct": 3.5053977476592695, "level_signals": [0.0, 1910.0645833333338, 3198.185416666667, 5083.74840425532, 5876.822916666667, 7744.858333333333, 8994.559042553192, 10848.572916666668, 11449.097916666666, 13279.586702127657, 14478.524999999998, 16287.427083333332, 17018.603723404256, 18745.377083333333, 19915.702083333334, 21628.004166666666]}, {"iteration": 4, "weights": [1.0, 2.0, 4.658, 9.803], "monotonic": true, "max_error_pct": 3.027797034526561, "level_signals": [0.0, 1857.7479166666662, 3115.357668439716, 4959.758333333333, 5719.74375, 7541.822916666666, 8773.477083333333, 10570.670833333334, 11613.364583333334, 13386.300000000001, 14565.18125, 16312.244902482269, 17009.158333333333, 18723.23541666667, 19859.012987588656, 21538.136391843975]}, {"iteration": 5, "weights": [1.0, 2.0, 5.022, 9.803], "monotonic": true, "max_error_pct": 3.4030146446492604, "level_signals": [0.0, 1801.708333333333, 3047.5804521276596, 4830.910416666666, 6001.418749999999, 7774.540026595743, 8989.13125, 10740.114583333332, 11372.286835106383, 13086.302083333334, 14263.602083333333, 15963.344281914893, 17053.927083333336, 18725.408111702127, 19826.375, 21450.33541666667]}, {"iteration": 6, "weights": [1.0, 2.0, 5.022, 10.192], "monotonic": true, "max_error_pct": 2.502924240162374, "level_signals": [0.0, 1784.416666666667, 2983.8291666666664, 4754.762854609929, 5892.072916666667, 7640.683333333333, 8815.310416666667, 10550.34370567376, 11566.579166666666, 13265.991666666669, 14416.591666666667, 16088.137322695038, 17142.125, 18782.45625, 19865.97774822695, 21457.05]}];
+const colors = ["#ff4444", "#ff8844", "#ffcc44", "#88cc44", "#44cc88", "#44aaff", "#8844ff"];
+
+const c = document.getElementById('conv'), ctx = c.getContext('2d');
+const W=c.width, H=c.height, m={l:60,r:150,t:20,b:40};
+const pw=W-m.l-m.r, ph=H-m.t-m.b;
+const mapX = l => m.l + l/15*pw;
+const mapY = v => m.t + ph - v*ph;
+
+// Grid
+ctx.strokeStyle='#333';ctx.lineWidth=0.5;
+for(let v=0;v<=1;v+=0.2){
+    ctx.beginPath();ctx.moveTo(m.l,mapY(v));ctx.lineTo(W-m.r,mapY(v));ctx.stroke();
+    ctx.fillStyle='#888';ctx.font='10px monospace';ctx.textAlign='right';
+    ctx.fillText(v.toFixed(1),m.l-5,mapY(v)+4);
+}
+for(let l=0;l<=15;l+=5){
+    const x=mapX(l);
+    ctx.beginPath();ctx.moveTo(x,m.t);ctx.lineTo(x,H-m.b);ctx.stroke();
+    ctx.fillStyle='#888';ctx.textAlign='center';ctx.fillText(l,x,H-m.b+15);
+}
+
+// Ideal line
+ctx.strokeStyle='#ffffff44';ctx.lineWidth=2;ctx.setLineDash([6,4]);
+ctx.beginPath();ctx.moveTo(mapX(0),mapY(0));ctx.lineTo(mapX(15),mapY(1));ctx.stroke();
+ctx.setLineDash([]);
+
+// Plot each iteration
+results.forEach((r, idx) => {
+    const maxSig = r.level_signals[15] || 1;
+    ctx.strokeStyle = colors[idx % colors.length];
+    ctx.lineWidth = idx === results.length-1 ? 3 : 1.5;
+    ctx.globalAlpha = idx === results.length-1 ? 1.0 : 0.5;
+    ctx.beginPath();
+    r.level_signals.forEach((s, level) => {
+        const n = s / maxSig;
+        level === 0 ? ctx.moveTo(mapX(level), mapY(n)) : ctx.lineTo(mapX(level), mapY(n));
+    });
+    ctx.stroke();
+
+    // Dots on final iteration
+    if (idx === results.length - 1) {
+        ctx.fillStyle = colors[idx % colors.length];
+        r.level_signals.forEach((s, level) => {
+            const n = s / maxSig;
+            ctx.beginPath(); ctx.arc(mapX(level), mapY(n), 3, 0, Math.PI*2); ctx.fill();
+        });
+    }
+    ctx.globalAlpha = 1.0;
+});
+
+// Legend
+const lx = W - m.r + 15;
+ctx.fillStyle='#aaa';ctx.font='11px monospace';ctx.textAlign='left';
+ctx.fillText('Iteration', lx, m.t+12);
+results.forEach((r, idx) => {
+    const y = m.t + 28 + idx * 40;
+    ctx.fillStyle = colors[idx % colors.length];
+    ctx.fillRect(lx, y-4, 12, 8);
+    ctx.fillStyle = '#ccc'; ctx.font='10px monospace';
+    const w = r.weights;
+    ctx.fillText('#'+idx+' ['+w.map(v=>v.toFixed(1)).join(',')+']', lx+16, y+4);
+    ctx.fillStyle = r.monotonic ? '#3fb950' : '#ff4444';
+    ctx.fillText((r.monotonic?'Mono':'!Mono')+' '+r.max_error_pct.toFixed(1)+'%', lx+16, y+16);
+});
+
+ctx.fillStyle='#aaa';ctx.font='12px monospace';ctx.textAlign='center';
+ctx.fillText('BCM Level', m.l+pw/2, H-5);
+
+// Summary text
+let txt = 'Iteration  Weights              Monotonic  MaxErr\n';
+txt += '─'.repeat(55) + '\n';
+results.forEach(r => {
+    const w = r.weights;
+    txt += r.iteration.toString().padStart(5) + '      [' +
+           w.map(v=>v.toFixed(2)).join(', ') + ']   ' +
+           (r.monotonic ? 'YES' : 'NO ').padEnd(10) +
+           r.max_error_pct.toFixed(1) + '%\n';
+});
+document.getElementById('summary').textContent = txt;
+</script></body></html>

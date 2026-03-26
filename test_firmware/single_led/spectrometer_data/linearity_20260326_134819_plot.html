@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html><head><title>G6 BCM Linearity — Spectrometer Sweep</title>
+<style>
+body { font-family: monospace; background: #1a1a2e; color: #e0e0e0; margin: 20px; }
+h2 { color: #00d4ff; }
+h3 { color: #aaa; margin-top: 15px; }
+canvas { border: 1px solid #444; background: #0d0d1a; display: block; margin: 5px 0 15px 0; }
+.stats { background: #222; padding: 10px; border-radius: 5px; margin: 10px 0; }
+.row { display: flex; gap: 20px; flex-wrap: wrap; }
+</style></head><body>
+<h2>G6 Panel — BCM Linearity (Spectrometer Sweep)</h2>
+<div class="stats">
+Integration: 250ms | Hold: 3s | Gap: 1.0s | Peak: 570.4nm | Dark: 14232 counts
+</div>
+
+<h3>Raw Time Trace (every dot = one 250ms read)</h3>
+<canvas id="trace" width="1200" height="350"></canvas>
+
+<div class="row">
+<div>
+<h3>Linearity (signal vs BCM level)</h3>
+<canvas id="linearity" width="500" height="350"></canvas>
+</div>
+<div>
+<h3>Results Table</h3>
+<pre id="table" style="font-size:12px;line-height:1.4;"></pre>
+</div>
+</div>
+
+<h3>Spectra per Level (captured at mid-hold)</h3><canvas id='spectra' width='1000' height='350'></canvas>
+
+<script>
+const times=[0.505, 0.758, 1.012, 1.265, 1.517, 1.77, 2.022, 2.281, 2.534, 2.786, 3.043, 3.295, 3.547, 3.804, 4.057, 4.309, 4.562, 4.814, 5.066, 5.32, 5.573, 5.825, 6.078, 6.333, 6.585, 6.838, 7.09, 7.348, 7.6, 7.853, 8.105, 8.358, 8.611, 8.864, 9.116, 9.375, 9.627, 9.879, 10.132, 10.384, 10.637, 10.89, 11.142, 11.395, 11.647, 11.9, 12.153, 12.405, 12.658, 12.91, 13.163, 13.417, 13.67, 13.922, 14.175, 14.43, 14.682, 14.934, 15.187, 15.439, 15.696, 15.949, 16.201, 16.453, 16.706, 16.959, 17.211, 17.464, 17.716, 17.972, 18.225, 18.478, 18.73, 18.982, 19.237, 19.49, 19.742, 19.994, 20.249, 20.502, 20.755, 21.007, 21.259, 21.515, 21.767, 22.02, 22.272, 22.524, 22.777, 23.029, 23.282, 23.535, 23.787, 24.04, 24.293, 24.545, 24.798, 25.05, 25.305, 25.558, 25.81, 26.063, 26.315, 26.57, 26.822, 27.075, 27.328, 27.585, 27.838, 28.09, 28.343, 28.596, 28.848, 29.102, 29.361, 29.613, 29.866, 30.118, 30.377, 30.629, 30.882, 31.135, 31.388, 31.642, 31.894, 32.147, 32.399, 32.654, 32.906, 33.158, 33.411, 33.664, 33.917, 34.169, 34.421, 34.674, 34.927, 35.179, 35.431, 35.683, 35.936, 36.188, 36.441, 36.697, 36.95, 37.203, 37.455, 37.708, 37.961, 38.213, 38.465, 38.718, 38.97, 39.223, 39.475, 39.728, 39.98, 40.233, 40.485, 40.737, 40.99, 41.242, 41.495, 41.75, 42.002, 42.255, 42.508, 42.76, 43.013, 43.266, 43.518, 43.771, 44.023, 44.275, 44.528, 44.781, 45.033, 45.293, 45.545, 45.798, 46.051, 46.303, 46.56, 46.813, 47.065, 47.322, 47.574, 47.827, 48.079, 48.336, 48.589, 48.841, 49.093, 49.347, 49.6, 49.853, 50.106, 50.362, 50.615, 50.867, 51.121, 51.373, 51.626, 51.878, 52.13, 52.383, 52.635, 52.888, 53.14, 53.393, 53.646, 53.898, 54.15, 54.405, 54.658, 54.91, 55.163, 55.415, 55.671, 55.928, 56.183, 56.435, 56.688, 56.942, 57.198, 57.452, 57.706, 57.959, 58.212, 58.465, 58.717, 58.97, 59.222, 59.475, 59.727, 59.979, 60.232, 60.491, 60.743, 60.996, 61.248, 61.503, 61.755, 62.008, 62.261, 62.514, 62.766, 63.019, 63.271, 63.524, 63.779, 64.032, 64.284, 64.536, 64.789, 65.041, 65.294, 65.546, 65.798, 66.051, 66.304, 66.557, 66.809, 67.062];
+const counts=[4408.1, 4411.9, 4424.1, 4419.6, 4429.4, 4438.9, 4440.1, 4433.9, 4438.6, 4440.3, 4453.2, 4444.6, 4447.3, 4452.1, 4450.8, 16619.9, 17681.4, 17674.9, 17675.7, 17679.2, 17680.2, 17674.2, 17686.7, 17679.8, 17652.7, 17663.2, 17169.6, 4474.4, 4480.9, 4477.0, 5615.0, 26866.7, 26868.9, 26890.4, 26904.3, 26923.9, 26861.3, 26847.6, 26907.2, 26910.4, 26860.3, 26880.6, 22617.0, 4494.7, 4488.1, 4485.4, 11034.4, 39517.1, 39549.4, 39557.4, 39522.4, 39524.1, 39556.4, 39570.3, 39577.3, 39532.4, 39544.9, 39494.6, 28743.9, 4502.8, 4505.9, 4512.5, 15996.2, 39837.3, 39797.1, 39824.6, 39804.5, 39807.4, 39813.5, 39748.5, 39741.1, 39789.8, 39769.1, 39809.9, 23735.9, 4511.3, 4510.4, 4517.0, 26318.4, 51468.1, 51444.0, 51433.2, 51403.7, 51384.3, 51419.6, 51375.8, 51392.5, 51384.9, 51414.8, 51367.5, 24689.6, 4528.8, 4519.4, 4526.8, 37415.5, 58232.6, 58223.3, 58165.5, 58202.6, 58202.7, 58193.3, 58181.6, 58186.9, 58167.2, 58192.6, 58169.4, 21223.1, 4539.0, 4530.6, 4525.4, 53322.3, 61988.8, 61984.3, 61951.7, 61957.4, 61919.8, 61938.5, 61911.6, 61937.4, 61950.7, 61935.7, 61939.8, 11822.8, 4532.5, 4538.5, 4535.0, 58389.7, 60710.3, 60671.4, 60693.4, 60703.7, 60679.5, 60669.2, 60676.0, 60701.0, 60645.7, 60666.8, 60525.8, 4541.0, 4540.9, 4530.1, 4775.4, 63355.8, 63355.3, 63345.7, 63342.4, 63348.0, 63295.1, 63323.4, 63305.9, 63332.3, 63323.7, 63326.7, 61364.6, 4542.0, 4542.9, 4550.7, 14440.3, 64524.2, 64537.7, 64526.1, 64523.6, 64497.9, 64466.1, 64493.4, 64495.7, 64488.9, 64500.3, 64457.8, 60753.2, 4560.2, 4558.4, 4553.4, 27229.7, 65340.8, 65339.5, 65339.1, 65346.3, 65329.8, 65338.2, 65323.3, 65327.6, 65345.4, 65326.7, 65333.2, 58898.5, 4561.0, 4562.3, 4556.0, 43253.0, 65346.3, 65335.8, 65332.7, 65336.9, 65330.2, 65340.0, 65326.0, 65329.1, 65315.4, 65329.8, 65323.6, 46613.4, 4570.8, 4566.6, 4556.5, 59396.0, 65535.0, 65535.0, 65535.0, 65535.0, 65535.0, 65535.0, 65535.0, 65535.0, 65535.0, 65535.0, 65535.0, 40027.5, 4575.6, 4563.6, 4569.7, 64195.7, 65535.0, 65535.0, 65535.0, 65535.0, 65535.0, 65535.0, 65535.0, 65535.0, 65535.0, 65535.0, 65535.0, 21669.2, 4566.4, 4569.0, 4572.8, 65535.0, 65535.0, 65535.0, 65535.0, 65535.0, 65535.0, 65535.0, 65535.0, 65535.0, 65535.0, 65535.0, 65535.0, 5172.6, 4568.0, 4565.2, 4567.8, 4563.0, 4559.8, 4567.6, 4558.8, 4555.9, 4556.8, 4570.8, 4563.1, 4557.7, 4569.8, 4558.0];
+const levelAvgs=[{"level": 0, "mean": 4428.49, "std": 12.038036938526682, "n": 10, "signal": -9803.031875, "normalized": -0.1910792841591576, "ideal": 0.0, "error_pct": -19.107928415915758}, {"level": 1, "mean": 17674.8, "std": 9.904207859961987, "n": 10, "signal": 3443.278124999999, "normalized": 0.06711588084945262, "ideal": 0.06666666666666667, "error_pct": 0.04492141827859564}, {"level": 2, "mean": 26885.49, "std": 25.602883952139173, "n": 10, "signal": 12653.968125000001, "normalized": 0.2466493225696869, "ideal": 0.13333333333333333, "error_pct": 11.331598923635358}, {"level": 3, "mean": 39542.92, "std": 24.921423180336166, "n": 10, "signal": 25311.398125, "normalized": 0.4933661235078299, "ideal": 0.2, "error_pct": 29.336612350782985}, {"level": 4, "mean": 39790.55, "std": 28.394297158252257, "n": 10, "signal": 25559.028125000004, "normalized": 0.4981928917709223, "ideal": 0.26666666666666666, "error_pct": 23.152622510425562}, {"level": 5, "mean": 51412.09, "std": 29.716155351741108, "n": 10, "signal": 37180.568125, "normalized": 0.7247182741569727, "ideal": 0.3333333333333333, "error_pct": 39.138494082363934}, {"level": 6, "mean": 58194.83, "std": 21.67518037859114, "n": 10, "signal": 43963.308125, "normalized": 0.8569264644764277, "ideal": 0.4, "error_pct": 45.69264644764277}, {"level": 7, "mean": 61947.59, "std": 24.864273790142313, "n": 10, "signal": 47716.068125, "normalized": 0.9300747214202643, "ideal": 0.4666666666666667, "error_pct": 46.34080547535976}, {"level": 8, "mean": 60681.7, "std": 20.080449308829493, "n": 10, "signal": 46450.178125, "normalized": 0.9054001760236406, "ideal": 0.5333333333333333, "error_pct": 37.20668426903073}, {"level": 9, "mean": 63329.85, "std": 19.039038841286587, "n": 10, "signal": 49098.328125, "normalized": 0.9570175340816622, "ideal": 0.6, "error_pct": 35.701753408166226}, {"level": 10, "mean": 64503.3, "std": 22.080591024697807, "n": 9, "signal": 50271.778125000004, "normalized": 0.9798902523239014, "ideal": 0.6666666666666666, "error_pct": 31.322358565723473}, {"level": 11, "mean": 65335.67, "std": 8.164156076683716, "n": 10, "signal": 51104.148125, "normalized": 0.9961146883742592, "ideal": 0.7333333333333333, "error_pct": 26.278135504092592}, {"level": 12, "mean": 65332.22, "std": 8.399708989668573, "n": 10, "signal": 51100.698125, "normalized": 0.9960474414715913, "ideal": 0.8, "error_pct": 19.604744147159124}, {"level": 13, "mean": 65535.0, "std": 0.0, "n": 10, "signal": 51303.478125, "normalized": 1.0, "ideal": 0.8666666666666667, "error_pct": 13.33333333333333}, {"level": 14, "mean": 65535.0, "std": 0.0, "n": 10, "signal": 51303.478125, "normalized": 1.0, "ideal": 0.9333333333333333, "error_pct": 6.666666666666665}, {"level": 15, "mean": 65535.0, "std": 0.0, "n": 9, "signal": 51303.478125, "normalized": 1.0, "ideal": 1.0, "error_pct": 0.0}];
+const dark=14231.521875;
+const period=4.0;
+const holdSec=3;
+
+// ── Trace ──
+(function(){
+const c=document.getElementById('trace'),ctx=c.getContext('2d');
+const W=c.width,H=c.height,m={l:70,r:20,t:15,b:40};
+const pw=W-m.l-m.r,ph=H-m.t-m.b;
+const tMax=Math.max(...times)+1;
+const cMin=Math.min(...counts)-30,cMax=Math.max(...counts)+30;
+const mapX=t=>m.l+t/tMax*pw;
+const mapY=v=>m.t+ph-(v-cMin)/(cMax-cMin)*ph;
+
+for(let i=0;i<16;i++){
+    const x1=mapX(i*period),x2=mapX(i*period+holdSec);
+    ctx.fillStyle=i%2?'rgba(0,200,100,0.06)':'rgba(0,100,200,0.06)';
+    ctx.fillRect(x1,m.t,x2-x1,ph);
+    ctx.fillStyle='#556';ctx.font='9px monospace';ctx.textAlign='center';
+    ctx.fillText('L'+i,(x1+x2)/2,m.t+10);
+}
+
+// Dark baseline
+ctx.strokeStyle='#44ff44';ctx.lineWidth=1;ctx.setLineDash([2,4]);
+ctx.beginPath();ctx.moveTo(m.l,mapY(dark));ctx.lineTo(W-m.r,mapY(dark));ctx.stroke();
+ctx.setLineDash([]);ctx.fillStyle='#44ff44';ctx.font='10px monospace';ctx.textAlign='right';
+ctx.fillText('dark '+dark.toFixed(0),W-m.r-5,mapY(dark)-5);
+
+const yStep=Math.pow(10,Math.floor(Math.log10(cMax-cMin)))/2;
+ctx.strokeStyle='#333';ctx.lineWidth=0.5;
+for(let v=Math.ceil(cMin/yStep)*yStep;v<=cMax;v+=yStep){
+    ctx.beginPath();ctx.moveTo(m.l,mapY(v));ctx.lineTo(W-m.r,mapY(v));ctx.stroke();
+    ctx.fillStyle='#888';ctx.font='10px monospace';ctx.textAlign='right';
+    ctx.fillText(v.toFixed(0),m.l-5,mapY(v)+4);
+}
+for(let t=0;t<=tMax;t+=10){ctx.fillStyle='#888';ctx.textAlign='center';ctx.fillText(t+'s',mapX(t),H-m.b+15);}
+
+ctx.strokeStyle='#00d4ff';ctx.lineWidth=1;ctx.beginPath();
+for(let i=0;i<times.length;i++){i===0?ctx.moveTo(mapX(times[i]),mapY(counts[i])):ctx.lineTo(mapX(times[i]),mapY(counts[i]));}
+ctx.stroke();
+ctx.fillStyle='#00d4ff';
+for(let i=0;i<times.length;i++){ctx.beginPath();ctx.arc(mapX(times[i]),mapY(counts[i]),1.5,0,Math.PI*2);ctx.fill();}
+ctx.fillStyle='#aaa';ctx.font='12px monospace';ctx.textAlign='center';
+ctx.fillText('Time (s)',W/2,H-5);
+})();
+
+// ── Linearity ──
+(function(){
+const c=document.getElementById('linearity'),ctx=c.getContext('2d');
+const W=c.width,H=c.height,m={l:60,r:20,t:15,b:40};
+const pw=W-m.l-m.r,ph=H-m.t-m.b;
+const mapX=l=>m.l+l/15*pw;
+const mapY=v=>m.t+ph-v*ph;
+
+ctx.strokeStyle='#333';ctx.lineWidth=0.5;
+for(let v=0;v<=1;v+=0.2){
+    ctx.beginPath();ctx.moveTo(m.l,mapY(v));ctx.lineTo(W-m.r,mapY(v));ctx.stroke();
+    ctx.fillStyle='#888';ctx.font='10px monospace';ctx.textAlign='right';ctx.fillText(v.toFixed(1),m.l-5,mapY(v)+4);
+}
+for(let l=0;l<=15;l+=5){const x=mapX(l);ctx.beginPath();ctx.moveTo(x,m.t);ctx.lineTo(x,H-m.b);ctx.stroke();
+    ctx.fillStyle='#888';ctx.textAlign='center';ctx.fillText(l,x,H-m.b+15);}
+
+ctx.strokeStyle='#555';ctx.lineWidth=1;ctx.setLineDash([4,4]);
+ctx.beginPath();ctx.moveTo(mapX(0),mapY(0));ctx.lineTo(mapX(15),mapY(1));ctx.stroke();
+ctx.setLineDash([]);ctx.fillStyle='#555';ctx.font='10px monospace';ctx.fillText('ideal',mapX(13),mapY(13/15)-8);
+
+const maxSig=levelAvgs[15]?levelAvgs[15].signal:1;
+ctx.strokeStyle='#00d4ff';ctx.lineWidth=2;ctx.beginPath();
+levelAvgs.forEach((la,i)=>{const n=la.signal/maxSig;i===0?ctx.moveTo(mapX(la.level),mapY(n)):ctx.lineTo(mapX(la.level),mapY(n));});
+ctx.stroke();
+ctx.fillStyle='#00d4ff';
+levelAvgs.forEach(la=>{const n=la.signal/maxSig;ctx.beginPath();ctx.arc(mapX(la.level),mapY(n),4,0,Math.PI*2);ctx.fill();});
+ctx.fillStyle='#aaa';ctx.font='12px monospace';ctx.textAlign='center';ctx.fillText('BCM Level',W/2,H-5);
+})();
+
+// ── Table ──
+(function(){
+const maxSig=levelAvgs[15]?levelAvgs[15].signal:1;
+let t='Level  N    Mean     Std   Signal    Norm   Ideal   Err\n';
+t+='─'.repeat(58)+'\n';
+levelAvgs.forEach(la=>{
+    const n=(la.signal/maxSig);
+    const ideal=la.level/15;
+    const err=(n-ideal)*100;
+    t+=la.level.toString().padStart(3)+'  '+la.n.toString().padStart(3)+'  '+
+       la.mean.toFixed(0).padStart(7)+'  '+la.std.toFixed(1).padStart(6)+'  '+
+       la.signal.toFixed(1).padStart(7)+'  '+n.toFixed(3).padStart(6)+'  '+
+       ideal.toFixed(3).padStart(6)+' '+(err>=0?'+':'')+err.toFixed(1).padStart(5)+'%\n';
+});
+const sigs=levelAvgs.map(la=>la.signal);
+const mono=sigs.every((s,i)=>i===0||s>=sigs[i-1]);
+t+='\nMonotonic: '+(mono?'YES':'NO');
+t+='\nDark: '+dark.toFixed(0)+' | Range: '+maxSig.toFixed(0)+' counts';
+document.getElementById('table').textContent=t;
+})();
+</script></body></html>

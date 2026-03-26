@@ -501,7 +501,7 @@ Integration: {integration_ms}ms | Hold: {hold_sec}s | Gap: {gap_sec}s | Peak: {p
 </div>
 </div>
 
-{"<h3>Spectra per Level (captured at mid-hold)</h3><canvas id='spectra' width='1000' height='350'></canvas>" if full_spectra else ""}
+{"<h3>Spectra per Level (captured at mid-hold, 570nm peak region)</h3><canvas id='spectra' width='1000' height='400'></canvas>" if full_spectra else ""}
 
 <script>
 const times={json.dumps(times)};
@@ -602,7 +602,99 @@ t+='\\nMonotonic: '+(mono?'YES':'NO');
 t+='\\nDark: '+dark.toFixed(0)+' | Range: '+maxSig.toFixed(0)+' counts';
 document.getElementById('table').textContent=t;
 }})();
-</script></body></html>"""
+"""
+
+    # Add spectra plot if data available
+    if full_spectra and wl:
+        # Downsample wavelengths and spectra to visible region (500-700nm)
+        wl_arr = np.array(wl)
+        vis = (wl_arr > 500) & (wl_arr < 700)
+        vis_idx = np.where(vis)[0]
+        step = max(1, len(vis_idx) // 300)  # ~300 points
+        sel_idx = vis_idx[::step]
+        wl_sel = wl_arr[sel_idx].tolist()
+
+        spectra_js = {}
+        for k, v in full_spectra.items():
+            arr = np.array(v)
+            spectra_js[k] = arr[sel_idx].tolist()
+
+        html += f"""
+// ── Spectra per level ──
+(function(){{
+const specCanvas=document.getElementById('spectra');
+if(!specCanvas) return;
+const ctx=specCanvas.getContext('2d');
+const W=specCanvas.width,H=specCanvas.height,m={{l:70,r:120,t:20,b:45}};
+const pw=W-m.l-m.r,ph=H-m.t-m.b;
+const wl={json.dumps(wl_sel)};
+const spectra={json.dumps(spectra_js)};
+const levels=Object.keys(spectra).map(Number).sort((a,b)=>a-b);
+
+const xMin=Math.min(...wl),xMax=Math.max(...wl);
+let allV=[];levels.forEach(l=>allV.push(...spectra[l]));
+const vMin=Math.min(...allV),vMax=Math.max(...allV);
+const pad=(vMax-vMin)*0.05;
+const mapX=x=>m.l+(x-xMin)/(xMax-xMin)*pw;
+const mapY=v=>m.t+ph-(v-vMin+pad)/(vMax-vMin+2*pad)*ph;
+
+// Grid
+ctx.strokeStyle='#333';ctx.lineWidth=0.5;
+for(let x=520;x<=680;x+=20){{
+    ctx.beginPath();ctx.moveTo(mapX(x),m.t);ctx.lineTo(mapX(x),H-m.b);ctx.stroke();
+    ctx.fillStyle='#888';ctx.font='10px monospace';ctx.textAlign='center';
+    ctx.fillText(x+'nm',mapX(x),H-m.b+15);
+}}
+const yStep=Math.pow(10,Math.floor(Math.log10(vMax-vMin)));
+for(let v=Math.ceil(vMin/yStep)*yStep;v<=vMax;v+=yStep){{
+    ctx.beginPath();ctx.moveTo(m.l,mapY(v));ctx.lineTo(W-m.r,mapY(v));ctx.stroke();
+    ctx.fillStyle='#888';ctx.font='10px monospace';ctx.textAlign='right';
+    ctx.fillText(v.toFixed(0),m.l-5,mapY(v)+4);
+}}
+
+// Peak line
+ctx.strokeStyle='#ff444466';ctx.lineWidth=1;ctx.setLineDash([3,3]);
+ctx.beginPath();ctx.moveTo(mapX({peak_nm}),m.t);ctx.lineTo(mapX({peak_nm}),H-m.b);ctx.stroke();
+ctx.setLineDash([]);
+
+// Draw each level's spectrum with color gradient (dark blue → bright cyan)
+levels.forEach(level=>{{
+    const frac=level/15;
+    const r=Math.round(20+frac*20);
+    const g=Math.round(80+frac*130);
+    const b=Math.round(180+frac*75);
+    ctx.strokeStyle='rgb('+r+','+g+','+b+')';
+    ctx.lineWidth=level===0?0.5:(level===15?2.5:1.2);
+    ctx.beginPath();
+    const sp=spectra[level];
+    for(let i=0;i<wl.length;i++){{
+        i===0?ctx.moveTo(mapX(wl[i]),mapY(sp[i])):ctx.lineTo(mapX(wl[i]),mapY(sp[i]));
+    }}
+    ctx.stroke();
+}});
+
+// Legend
+const lx=W-m.r+10;
+ctx.fillStyle='#aaa';ctx.font='11px monospace';ctx.textAlign='left';
+ctx.fillText('Level',lx,m.t+12);
+levels.forEach((level,i)=>{{
+    const y=m.t+25+i*20;
+    const frac=level/15;
+    const r=Math.round(20+frac*20);
+    const g=Math.round(80+frac*130);
+    const b=Math.round(180+frac*75);
+    ctx.fillStyle='rgb('+r+','+g+','+b+')';
+    ctx.fillRect(lx,y-5,15,10);
+    ctx.fillStyle='#ccc';ctx.font='10px monospace';
+    ctx.fillText(level.toString(),lx+20,y+4);
+}});
+
+ctx.fillStyle='#aaa';ctx.font='12px monospace';ctx.textAlign='center';
+ctx.fillText('Wavelength (nm)',m.l+pw/2,H-5);
+}})();
+"""
+
+    html += "\n</script></body></html>"
 
     plot_path = json_path.replace('.json', '_plot.html')
     with open(plot_path, 'w') as f:
