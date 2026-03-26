@@ -2250,7 +2250,7 @@ static void cmd_bcmburst(const char* arg) {
     uint32_t base_cycles = (uint32_t)(bcm_base_on_us * cycles_per_us);
     float est_burst_us = 0;
     for (int b = 0; b < bcm_bits; b++) {
-        est_burst_us += bcm_base_on_us * (1 << b) + 0.40f; // ~0.40 µs overhead per pass
+        est_burst_us += bcm_base_on_us * bcm_weight[b] + 0.40f; // ~0.40 µs overhead per pass
     }
     float period_us = 1000000.0f / rate;
 
@@ -3187,7 +3187,7 @@ static void cmd_photocal(const char* arg) {
     delay(50);
     while (Serial.available()) Serial.read();
 
-    float gap_sec = 0.5f;  // all-OFF gap between levels for easy Saleae parsing
+    float gap_sec = 1.0f;  // all-OFF gap between levels for spectrometer/Saleae segmentation
     uint32_t gap_triggers = (uint32_t)(gap_sec * rate);
 
     Serial.println("--- PHOTOCAL START ---");
