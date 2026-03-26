@@ -97,63 +97,46 @@ s3.addText("Photodiode signal via Saleae Logic Pro 8 analog input", {
 });
 
 // ═══════════════════════════════════════════════════════════════
-// SLIDE 4: Spectrometer Linearity — Default Weights
+// SLIDE 4: LED Spectra across 16 levels
 // ═══════════════════════════════════════════════════════════════
 let s4 = pres.addSlide();
 s4.background = { color: C.bg };
-s4.addShape(pres.shapes.RECTANGLE, { x:0, y:0, w:10, h:0.06, fill:{color:C.accent3} });
-s4.addText("BCM Linearity — Default Weights [1, 2, 4, 8]", { x:0.6, y:0.25, w:9, h:0.5, fontSize:28, fontFace:"Arial Black", color:C.white, bold:true, margin:0 });
-
-// Linearity data
-const baselineNorm = [0.0, 0.1002, 0.1677, 0.2665, 0.2671, 0.3646, 0.4302, 0.5261, 0.5127, 0.6074, 0.6708, 0.7638, 0.7615, 0.8528, 0.9127, 1.0];
-const ideal = [0.0, 0.0667, 0.1333, 0.2, 0.2667, 0.3333, 0.4, 0.4667, 0.5333, 0.6, 0.6667, 0.7333, 0.8, 0.8667, 0.9333, 1.0];
-
-// Draw linearity chart as a table-like visual
-const chartData = [["Level", "Norm", "Ideal", "Error"]];
-for (let i = 0; i < 16; i++) {
-  const err = ((baselineNorm[i] - ideal[i]) * 100).toFixed(1);
-  chartData.push([i.toString(), baselineNorm[i].toFixed(3), ideal[i].toFixed(3), (err >= 0 ? "+" : "") + err + "%"]);
-}
-
-// Left side: key findings
-s4.addShape(pres.shapes.ROUNDED_RECTANGLE, { x:0.6, y:0.9, w:4.5, h:3.6, fill:{color:C.bgCard}, line:{color:C.border,width:1}, rectRadius:0.1 });
-s4.addText("Ocean Insight Flame X Spectrometer", { x:0.8, y:1.0, w:4.1, h:0.3, fontSize:14, fontFace:"Calibri", color:C.accent, bold:true, margin:0 });
+s4.addShape(pres.shapes.RECTANGLE, { x:0, y:0, w:10, h:0.06, fill:{color:C.accent} });
+s4.addText("LED Spectra — 16 BCM Intensity Levels", { x:0.6, y:0.25, w:9, h:0.5, fontSize:28, fontFace:"Arial Black", color:C.white, bold:true, margin:0 });
+s4.addImage({ path:"slide_plots/spectra_16levels.png", x:0.3, y:0.8, w:6.5, h:3.3 });
+s4.addShape(pres.shapes.ROUNDED_RECTANGLE, { x:7.0, y:0.8, w:2.7, h:3.3, fill:{color:C.bgCard}, line:{color:C.border,width:1}, rectRadius:0.1 });
 s4.addText([
-  { text:"LED peak: 570.8 nm\n", options:{breakLine:true, fontSize:12, bold:true} },
-  { text:"Integration: 50ms | Window: 560-580nm (20nm)\n", options:{breakLine:true, fontSize:10} },
-  { text:"T = 0.7 µs | All 400 LEDs | DWT trigger\n\n", options:{breakLine:true, fontSize:10} },
-  { text:"NOT monotonic\n", options:{breakLine:true, fontSize:14, bold:true, color:C.accent3} },
-  { text:"Max error: 6.7%\n\n", options:{breakLine:true, fontSize:12, color:C.accent3} },
-  { text:"Problem: L3 ≈ L4, L7 > L8, L11 ≈ L12\n", options:{breakLine:true, fontSize:11, bold:true} },
-  { text:"Bit-plane boundaries are non-monotonic\n\n", options:{breakLine:true, fontSize:10} },
-  { text:"Root cause: brightness per µs decays\n", options:{breakLine:true, fontSize:11, bold:true, color:C.accent} },
-  { text:"B0: 3163 cts/µs\n", options:{breakLine:true, fontSize:10, fontFace:"Consolas"} },
-  { text:"B1: 2648 cts/µs (−16%)\n", options:{breakLine:true, fontSize:10, fontFace:"Consolas"} },
-  { text:"B2: 2108 cts/µs (−33%)\n", options:{breakLine:true, fontSize:10, fontFace:"Consolas"} },
-  { text:"B3: 2024 cts/µs (−36%)", options:{fontSize:10, fontFace:"Consolas"} },
-], { x:0.8, y:1.35, w:4.1, h:3.0, fontFace:"Calibri", color:C.text, margin:0 });
+  { text:"Ocean Insight Flame X\n", options:{breakLine:true, fontSize:12, bold:true} },
+  { text:"570.8 nm peak\n", options:{breakLine:true, fontSize:11, color:C.accent} },
+  { text:"50ms integration\n", options:{breakLine:true, fontSize:10} },
+  { text:"560-580nm window (20nm)\n\n", options:{breakLine:true, fontSize:10} },
+  { text:"T = 0.7 µs\n", options:{breakLine:true, fontSize:11, fontFace:"Consolas"} },
+  { text:"All 400 LEDs active\n\n", options:{breakLine:true, fontSize:10} },
+  { text:"Signal grows linearly\nwith BCM level (0→15)\n\n", options:{breakLine:true, fontSize:10} },
+  { text:"Spectra captured at\nmiddle of each 3s hold", options:{fontSize:9, color:C.textMuted} },
+], { x:7.2, y:0.95, w:2.4, h:3.0, fontFace:"Calibri", color:C.text, margin:0 });
+s4.addText("Raw time trace (16 levels × 3s + 1s OFF gaps)", { x:0.3, y:4.2, w:6.5, h:0.2, fontSize:9, fontFace:"Calibri", color:C.textMuted, italic:true, margin:0 });
+s4.addImage({ path:"slide_plots/time_trace.png", x:0.3, y:4.35, w:9.4, h:1.05 });
 
-// Right side: data table
-s4.addText("Measured vs Ideal", { x:5.4, y:0.9, w:4.2, h:0.3, fontSize:14, fontFace:"Calibri", color:C.accent, bold:true, margin:0 });
+// ═══════════════════════════════════════════════════════════════
+// SLIDE 4b: Linearity — Default Weights (data plot)
+// ═══════════════════════════════════════════════════════════════
+let s4b = pres.addSlide();
+s4b.background = { color: C.bg };
+s4b.addShape(pres.shapes.RECTANGLE, { x:0, y:0, w:10, h:0.06, fill:{color:C.accent3} });
+s4b.addText("BCM Linearity — Default Weights [1, 2, 4, 8]", { x:0.6, y:0.25, w:9, h:0.5, fontSize:28, fontFace:"Arial Black", color:C.white, bold:true, margin:0 });
+s4b.addImage({ path:"slide_plots/linearity_default.png", x:0.3, y:0.8, w:5.2, h:3.9 });
+s4b.addImage({ path:"slide_plots/bitplane_brightness.png", x:5.5, y:0.8, w:4.2, h:3.3 });
+s4b.addText([
+  { text:"Non-monotonic at bit-plane boundaries:\n", options:{breakLine:true, fontSize:11, bold:true, color:C.accent3} },
+  { text:"L3 (B0+B1) ≈ L4 (B2)  |  L7 (B0+B1+B2) > L8 (B3)  |  L11 ≈ L12", options:{fontSize:10} },
+], { x:5.5, y:4.2, w:4.2, h:0.6, fontFace:"Calibri", color:C.text, margin:0 });
+s4b.addText("Longer bit-planes produce less light per µs — 56% drop from B0 to B3", { x:0.3, y:4.85, w:9.4, h:0.25, fontSize:11, fontFace:"Calibri", color:C.accent, italic:true, margin:0 });
 
-const tblDefault = [["Lv", "Measured", "Ideal", "Err"]];
-for (let i = 0; i < 16; i++) {
-  const err = ((baselineNorm[i] - ideal[i]) * 100);
-  const errStr = (err >= 0 ? "+" : "") + err.toFixed(1) + "%";
-  tblDefault.push([i.toString(), baselineNorm[i].toFixed(3), ideal[i].toFixed(3), errStr]);
-}
-s4.addTable(tblDefault, {
-  x:5.4, y:1.25, w:4.2,
-  rowH: Array(17).fill(0.22),
-  colW: [0.5, 1.2, 1.0, 1.0],
-  fontSize: 9, fontFace:"Consolas", color:C.text,
-  border: { type:"solid", pt:0.3, color:C.border },
-  autoPage: false,
-  rowOpts: [{ fill:{color:C.accent}, color:C.bg, bold:true, fontSize:8, fontFace:"Calibri" }],
-});
-
-// Highlight non-monotonic rows (3-4, 7-8, 11-12) — mark with colored text in the err column
-s4.addText("← Non-monotonic pairs highlighted", { x:5.4, y:4.75, w:4.2, h:0.2, fontSize:9, fontFace:"Calibri", color:C.accent3, italic:true, margin:0 });
+// Data for comparison tables
+const baselineNorm = [0.0, 0.1002, 0.1677, 0.2665, 0.2671, 0.3646, 0.4302, 0.5261, 0.5127, 0.6074, 0.6708, 0.7638, 0.7615, 0.8528, 0.9127, 1.0];
+const optimizedNorm = [0.0, 0.0832, 0.1391, 0.2216, 0.2746, 0.3561, 0.4108, 0.4917, 0.5391, 0.6183, 0.6719, 0.7498, 0.7989, 0.8754, 0.9258, 1.0];
+const ideal = [0.0, 0.0667, 0.1333, 0.2, 0.2667, 0.3333, 0.4, 0.4667, 0.5333, 0.6, 0.6667, 0.7333, 0.8, 0.8667, 0.9333, 1.0];
 
 // ═══════════════════════════════════════════════════════════════
 // SLIDE 5: Optimized Weights — Convergence
@@ -189,20 +172,10 @@ s5.addTable(convData, {
   ],
 });
 
-// Right side: key insight
-s5.addShape(pres.shapes.ROUNDED_RECTANGLE, { x:6.4, y:0.9, w:3.2, h:2.5, fill:{color:C.bgCard}, line:{color:C.border,width:1}, rectRadius:0.1 });
-s5.addText("Key Insight", { x:6.6, y:1.0, w:2.8, h:0.3, fontSize:14, fontFace:"Calibri", color:C.accent2, bold:true, margin:0 });
-s5.addText([
-  { text:"Only B2 and B3 needed\nadjustment\n\n", options:{breakLine:true, fontSize:12, bold:true} },
-  { text:"B0, B1 unchanged at 1, 2\n\n", options:{breakLine:true, fontSize:11} },
-  { text:"B2: 4.00 → 5.02 (+26%)\n", options:{breakLine:true, fontSize:11, fontFace:"Consolas", color:C.accent3} },
-  { text:"B3: 8.00 → 10.19 (+27%)\n\n", options:{breakLine:true, fontSize:11, fontFace:"Consolas", color:C.accent3} },
-  { text:"Compensates for\nbrightness-per-µs decay\nin longer bit-planes", options:{fontSize:10, color:C.textMuted} },
-], { x:6.6, y:1.35, w:2.8, h:1.9, fontFace:"Calibri", color:C.text, margin:0 });
+// Right side: before/after plot
+s5.addImage({ path:"slide_plots/linearity_optimized.png", x:5.8, y:0.8, w:4.0, h:3.0 });
 
 // Bottom: before/after comparison
-const optimizedNorm = [0.0, 0.0832, 0.1391, 0.2216, 0.2746, 0.3561, 0.4108, 0.4917, 0.5391, 0.6183, 0.6719, 0.7498, 0.7989, 0.8754, 0.9258, 1.0];
-
 s5.addText("Before → After", { x:0.6, y:3.85, w:9, h:0.3, fontSize:14, fontFace:"Calibri", color:C.accent, bold:true, margin:0 });
 
 const compData = [["Level", "0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15"]];
