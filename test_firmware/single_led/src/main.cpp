@@ -3725,6 +3725,7 @@ static void cmd_help() {
     Serial.println("BCM <bits>       Set BCM bit depth (1-8, default 4)");
     Serial.println("BCMON <us>       Set BCM base time T (default 0.5 us)");
     Serial.println("BCMWEIGHTS w0 w1 ..  Set custom bit-plane weights (e.g. 1.2 2.2 4.1 8)");
+    Serial.println("BCMORDER REV|FWD    Scan order: REVERSE (B3->B0) or NORMAL (B0->B3)");
     Serial.println("BCMORDER REV|FWD    Bit-plane scan order: REV=B3→B0, FWD=B0→B3");
     Serial.println("BCMWEIGHTS RESET     Reset to default power-of-2 weights");
     Serial.println("FILL <intensity> Fill all pixels with value");
@@ -4376,6 +4377,8 @@ static void process_command() {
         cmd_bcmvisual(args);
     } else if (strcmp(cmd_buf, "RAMBURST") == 0) {
         cmd_ramburst(args);
+    } else if (strcmp(cmd_buf, "BCMORDER") == 0) {
+        cmd_bcmorder(args);
     } else if (strcmp(cmd_buf, "EXTTRIG") == 0) {
         cmd_exttrig(args);
     } else if (strcmp(cmd_buf, "TRIGTEST") == 0) {
