@@ -7,3 +7,9 @@ saleae_captures/
 node_modules/
 package-lock.json
 package.json
+
+# AD3 raw capture data (reproducible via ad3_capture.py; excluded from repo
+# to avoid GitHub's 100 MB file limit and keep checkout small). Summary HTML
+# viewers built from these captures ARE committed.
+test_firmware/single_led/ad3_*.npz
+
