@@ -266,8 +266,8 @@ static void precompute_scan_masks() {
         row_on_mask[r] = (1ULL << ROW_PIN[r]);
     }
 
-    // Column masks based on current pattern
-    // Reversed polarity: LOW = ON, HIGH = OFF
+    // Column masks based on current pattern.
+    // Normal polarity (v0.2.1 / v0.3.1): HIGH = ON, LOW = OFF.
     all_col_mask = 0;
     col_on_mask = 0;
     col_off_mask = 0;
@@ -275,9 +275,9 @@ static void precompute_scan_masks() {
         uint64_t pin_mask = (1ULL << COL_PIN[c]);
         all_col_mask |= pin_mask;
         if (col_pattern & (1UL << c)) {
-            col_on_mask |= pin_mask;   // this column should be ON (driven LOW)
+            col_on_mask |= pin_mask;   // this column should be ON (driven HIGH)
         } else {
-            col_off_mask |= pin_mask;  // this column should be OFF (driven HIGH)
+            col_off_mask |= pin_mask;  // this column should be OFF (driven LOW)
         }
     }
 }
@@ -302,10 +302,11 @@ static void precompute_bcm_data() {
                       ? (on_cycles_b - PIO_ON_OVERHEAD_CYCLES) : 0;
     }
 
-    // Start with all columns OFF (HIGH = 0xFFFFF in PIO inverted encoding)
+    // Start with all columns OFF. Normal polarity (col HIGH = ON) means
+    // all-OFF = all bits 0 in the PIO word.
     for (int r = 0; r < PANEL_SIZE; r++) {
         for (int b = 0; b < bcm_bits; b++) {
-            bcm_plane_data[r][b][0] = 0xFFFFF;  // all columns HIGH = all OFF
+            bcm_plane_data[r][b][0] = 0x00000;  // all columns LOW = all OFF
             bcm_plane_data[r][b][1] = pio_delays[b];
         }
     }
@@ -319,8 +320,8 @@ static void precompute_bcm_data() {
             uint8_t intensity = pixel_data[lr][lc];
             for (int b = 0; b < bcm_bits; b++) {
                 if (intensity & (1 << b)) {
-                    // Clear this column's bit → drive LOW → LED ON
-                    bcm_plane_data[sch_row][b][0] &= ~(1UL << sch_col);
+                    // Set this column's bit → drive HIGH → LED ON
+                    bcm_plane_data[sch_row][b][0] |= (1UL << sch_col);
                 }
             }
         }
@@ -332,10 +333,10 @@ static void precompute_bcm_data() {
 static void precompute_bcm_row(uint8_t sch_row) {
     uint32_t base_cycles = (uint32_t)(bcm_base_on_us * cycles_per_us);
 
-    // Init this row's planes to all-OFF (using weights)
+    // Init this row's planes to all-OFF (all bits 0 under normal polarity)
     for (int b = 0; b < bcm_bits; b++) {
         uint32_t on_cycles_b = (uint32_t)(base_cycles * bcm_weight[b]);
-        bcm_plane_data[sch_row][b][0] = 0xFFFFF;
+        bcm_plane_data[sch_row][b][0] = 0x00000;
         bcm_plane_data[sch_row][b][1] = (on_cycles_b > PIO_ON_OVERHEAD_CYCLES)
                                        ? (on_cycles_b - PIO_ON_OVERHEAD_CYCLES) : 0;
     }
@@ -348,7 +349,7 @@ static void precompute_bcm_row(uint8_t sch_row) {
             uint8_t intensity = pixel_data[lr][lc];
             for (int b = 0; b < bcm_bits; b++) {
                 if (intensity & (1 << b)) {
-                    bcm_plane_data[sch_row][b][0] &= ~(1UL << sch_col);
+                    bcm_plane_data[sch_row][b][0] |= (1UL << sch_col);
                 }
             }
         }
@@ -359,15 +360,15 @@ static void precompute_bcm_row(uint8_t sch_row) {
 // PIO column driver program (Phase 3b)
 // ---------------------------------------------------------------------------
 // Protocol:
-//   1. Push all-OFF mask (0xFFFFF) once at start → stored in Y register
-//   2. Per row: push column pattern (pre-inverted), push delay count
+//   1. Push all-OFF mask (0x00000 under normal polarity) once at start → stored in Y register
+//   2. Per row: push column pattern (1-bit = col HIGH = ON, normal polarity), push delay count
 //   3. PIO sets columns, delays, clears columns, signals IRQ
 //
 // Pin mapping: OUT pins base=GP1, count=20
 // Timing: ON time = (delay_count + 5) PIO cycles from column set to clear
 //
 // Assembly:
-//   addr 0: pull block           ; get all-OFF mask (0xFFFFF)
+//   addr 0: pull block           ; get all-OFF mask (0x00000, normal polarity)
 //   addr 1: mov y, osr           ; y = permanent all-OFF value
 //   addr 2: pull block           ; [wrap_target] get column pattern
 //   addr 3: out pins, 20         ; set all 20 column pins → LEDs ON
@@ -460,7 +461,7 @@ static void col_pins_to_sio() {
     for (int c = 0; c < PANEL_SIZE; c++) {
         gpio_set_function(COL_PIN[c], GPIO_FUNC_SIO);
         gpio_set_dir(COL_PIN[c], GPIO_OUT);
-        gpio_put(COL_PIN[c], 1);  // OFF state (HIGH)
+        gpio_put(COL_PIN[c], 0);  // OFF state (col LOW, normal polarity)
     }
 }
 
@@ -496,7 +497,7 @@ static void all_off();  // forward declaration
 
 // Precompute DMA column data buffer from current scan parameters.
 static void precompute_dma_col_data() {
-    uint32_t pio_col_word = (~col_pattern) & 0xFFFFF;
+    uint32_t pio_col_word = col_pattern & 0xFFFFF;
     uint32_t pio_delay = (on_cycles > PIO_ON_OVERHEAD_CYCLES)
                        ? (on_cycles - PIO_ON_OVERHEAD_CYCLES) : 0;
     for (int r = 0; r < active_rows; r++) {
@@ -526,7 +527,7 @@ static bool dma_init_channel() {
 // IRQ releases PIO which immediately pulls column data and drives columns ON.
 static void __attribute__((noinline)) __not_in_flash_func(pio_row_isr)() {
     // Clear previous row (columns are already OFF from PIO)
-    gpio_clr_mask64(row_on_mask[isr_current_row]);
+    gpio_set_mask64(row_on_mask[isr_current_row]);
 
     isr_current_row++;
     if (isr_current_row >= isr_active_rows) {
@@ -537,7 +538,7 @@ static void __attribute__((noinline)) __not_in_flash_func(pio_row_isr)() {
     }
 
     // Set next row BEFORE releasing PIO
-    gpio_set_mask64(row_on_mask[isr_current_row]);
+    gpio_clr_mask64(row_on_mask[isr_current_row]);
 
     // Release PIO — resumes from irq wait, wraps to pull block,
     // gets DMA-fed column data, drives columns ON on the new row
@@ -587,10 +588,10 @@ static void hybrid_debug_test() {
     pio_interrupt_clear(pio_hw_inst, 0);
     pio_sm_set_enabled(pio_hw_inst, pio_sm_idx, true);
 
-    pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, 0xFFFFF);  // init Y
-    gpio_set_mask64(row_on_mask[0]);
+    pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, 0x00000);  // all cols OFF under normal polarity  // init Y
+    gpio_clr_mask64(row_on_mask[0]);
 
-    uint32_t pio_col_word = (~col_pattern) & 0xFFFFF;
+    uint32_t pio_col_word = col_pattern & 0xFFFFF;
     pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, pio_col_word);
     pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, 0);  // min delay
 
@@ -605,7 +606,7 @@ static void hybrid_debug_test() {
         Serial.println("  PIO irq wait 0: OK");
         pio_interrupt_clear(pio_hw_inst, 0);
     }
-    gpio_clr_mask64(row_on_mask[0]);
+    gpio_set_mask64(row_on_mask[0]);
     pio_sm_set_enabled(pio_hw_inst, pio_sm_idx, false);
 
     // Step 2: DMA column feed test (DMA pushes data, CPU polls IRQ)
@@ -614,8 +615,8 @@ static void hybrid_debug_test() {
     pio_sm_restart(pio_hw_inst, pio_sm_idx);
     pio_sm_exec(pio_hw_inst, pio_sm_idx, pio_encode_jmp(pio_offset));
     pio_interrupt_clear(pio_hw_inst, 0);
-    pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, 0xFFFFF);  // init Y
-    gpio_set_mask64(row_on_mask[0]);
+    pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, 0x00000);  // all cols OFF under normal polarity  // init Y
+    gpio_clr_mask64(row_on_mask[0]);
 
     dma_channel_config cfg = dma_channel_get_default_config(ch_col);
     channel_config_set_transfer_data_size(&cfg, DMA_SIZE_32);
@@ -642,7 +643,7 @@ static void hybrid_debug_test() {
         Serial.println("  DMA -> PIO -> IRQ: OK");
         pio_interrupt_clear(pio_hw_inst, 0);
     }
-    gpio_clr_mask64(row_on_mask[0]);
+    gpio_set_mask64(row_on_mask[0]);
     pio_sm_set_enabled(pio_hw_inst, pio_sm_idx, false);
     dma_channel_abort(ch_col);
 
@@ -652,13 +653,13 @@ static void hybrid_debug_test() {
     pio_sm_restart(pio_hw_inst, pio_sm_idx);
     pio_sm_exec(pio_hw_inst, pio_sm_idx, pio_encode_jmp(pio_offset));
     pio_interrupt_clear(pio_hw_inst, 0);
-    pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, 0xFFFFF);
+    pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, 0x00000);  // all cols OFF under normal polarity
 
     isr_current_row = 0;
     isr_active_rows = active_rows;
     isr_frame_done = false;
 
-    gpio_set_mask64(row_on_mask[0]);
+    gpio_clr_mask64(row_on_mask[0]);
 
     dma_channel_configure(ch_col, &cfg,
         &pio_hw_inst->txf[pio_sm_idx],
@@ -708,7 +709,7 @@ static uint32_t __not_in_flash_func(run_hybrid_single_frame)() {
     pio_interrupt_clear(pio_hw_inst, 0);
 
     // Init PIO Y register (all-OFF mask)
-    pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, 0xFFFFF);
+    pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, 0x00000);  // all cols OFF under normal polarity
 
     // Reset ISR state
     isr_current_row = 0;
@@ -720,7 +721,7 @@ static uint32_t __not_in_flash_func(run_hybrid_single_frame)() {
     dma_channel_set_trans_count(ch_col, active_rows * 2, false);
 
     // Set first row (ISR handles subsequent rows)
-    gpio_set_mask64(row_on_mask[0]);
+    gpio_clr_mask64(row_on_mask[0]);
 
     uint32_t t0 = m33_hw->dwt_cyccnt;
 
@@ -852,7 +853,7 @@ static const pio_program_t msm_row_program = {
 };
 
 // Column SM program (PIO0): 11 instructions
-//   addr 0: pull block         ; init: get all-OFF mask (0xFFFFF)
+//   addr 0: pull block         ; init: get all-OFF mask (0x00000, normal polarity)
 //   addr 1: mov y, osr         ; y = permanent all-OFF value
 //   addr 2: wait 1 irq 0       ; [wrap target] wait for bridge ISR to force flag 0
 //   addr 3: pull block          ; get column pattern from DMA
@@ -944,12 +945,19 @@ static uint32_t msm_row_patterns[PANEL_SIZE + 1];
 // pull(1) + mov(1) + jmp_loop(x+1) + mov(1) + out(1) = x + 5 cycles
 #define MSM_COL_ON_OVERHEAD 5
 
-// Precompute 24-bit one-hot row patterns.
+// Precompute 24-bit row patterns for MSM row SM.
+// Normal polarity (row LOW = active): pattern is inverted one-hot —
+// active row bit is 0, all other row bits are 1. Terminator is all-ones
+// (all rows HIGH = all OFF).
+// NOTE: the `ROW_PIN[r] - 21` offset is v0.2.1-specific (base GP21). MSMSCAN
+// on v0.3.1 (row base GP20) needs a redesigned PIO program — scheduled for
+// Phase 4 PIOFULL.
 static void msm_precompute_row_patterns() {
+    const uint32_t ALL_OFF_24 = 0x00FFFFFFu;  // 24-bit span, all row pins HIGH
     for (int r = 0; r < active_rows; r++) {
-        msm_row_patterns[r] = 1UL << (ROW_PIN[r] - 21);
+        msm_row_patterns[r] = ALL_OFF_24 & ~(1UL << (ROW_PIN[r] - 21));
     }
-    msm_row_patterns[active_rows] = 0;  // all-OFF terminator
+    msm_row_patterns[active_rows] = ALL_OFF_24;  // all rows OFF terminator
 }
 
 // --- IRQ bridge ISRs (RAM-resident for minimum latency) ---
@@ -1127,12 +1135,12 @@ static void msm_pins_to_sio() {
     for (int c = 0; c < PANEL_SIZE; c++) {
         gpio_set_function(COL_PIN[c], GPIO_FUNC_SIO);
         gpio_set_dir(COL_PIN[c], GPIO_OUT);
-        gpio_put(COL_PIN[c], 1);  // OFF
+        gpio_put(COL_PIN[c], 0);  // OFF (col LOW, normal polarity)
     }
     for (int r = 0; r < PANEL_SIZE; r++) {
         gpio_set_function(ROW_PIN[r], GPIO_FUNC_SIO);
         gpio_set_dir(ROW_PIN[r], GPIO_OUT);
-        gpio_put(ROW_PIN[r], 0);  // OFF
+        gpio_put(ROW_PIN[r], 1);  // OFF (row HIGH)
     }
 }
 
@@ -1230,7 +1238,7 @@ static uint32_t __not_in_flash_func(msm_run_single_frame)() {
     pio_interrupt_clear(msm_col_pio, 1);
 
     // Push all-OFF init mask to column SM (addr 0-1: pull, mov y)
-    pio_sm_put_blocking(msm_col_pio, msm_col_sm, 0xFFFFF);
+    pio_sm_put_blocking(msm_col_pio, msm_col_sm, 0x00000);  // all cols OFF under normal polarity
 
     // Reset DMA read addresses and transfer counts
     // No terminator — send exactly active_rows row patterns
@@ -1278,7 +1286,7 @@ static void __attribute__((noinline)) __not_in_flash_func(msm_run_scan_frames)(u
     msm_precompute_row_patterns();
 
     // Fill column data buffer
-    uint32_t pio_col_word = (~col_pattern) & 0xFFFFF;
+    uint32_t pio_col_word = col_pattern & 0xFFFFF;
     uint32_t pio_delay = (on_cycles > MSM_COL_ON_OVERHEAD)
                        ? (on_cycles - MSM_COL_ON_OVERHEAD) : 0;
     for (int r = 0; r < active_rows; r++) {
@@ -1359,7 +1367,7 @@ static void msm_debug_test() {
 
         // Col SM: pull (all-OFF), mov y, wait irq 0, pull (col), out pins (ON),
         //         pull (delay), ...
-        pio_sm_put_blocking(msm_col_pio, msm_col_sm, 0xFFFFF); // all-OFF init
+        pio_sm_put_blocking(msm_col_pio, msm_col_sm, 0x00000);  // all cols OFF under normal polarity // all-OFF init
 
         // Enable bridge ISRs
         msm_irq_enable();
@@ -1374,7 +1382,7 @@ static void msm_debug_test() {
         delayMicroseconds(100);
 
         // Now push column data: pattern + very long delay
-        uint32_t col_word = (~col_pattern) & 0xFFFFF;  // inverted for ON
+        uint32_t col_word = col_pattern & 0xFFFFF;  // normal polarity: 1-bit = col HIGH = ON
         pio_sm_put_blocking(msm_col_pio, msm_col_sm, col_word);
         pio_sm_put_blocking(msm_col_pio, msm_col_sm, 0xFFFFFFFF); // max delay ~28 sec
 
@@ -1387,10 +1395,10 @@ static void msm_debug_test() {
         Serial.print("  gpio_lo=0x"); Serial.println(gpio_lo, HEX);
         Serial.print("  gpio_hi=0x"); Serial.println(gpio_hi, HEX);
         Serial.print("  Row 0 (GP"); Serial.print(ROW_PIN[0]);
-        Serial.print(") HIGH? ");
-        Serial.println((gpio_in & row_on_mask[0]) ? "YES" : "NO");
+        Serial.print(") LOW (active)? ");
+        Serial.println((gpio_in & row_on_mask[0]) ? "NO" : "YES");
 
-        // Check column pins — should be LOW (ON) for active columns
+        // Check column pins — under normal polarity, HIGH = ON
         bool any_col_low = false;
         bool any_col_high = false;
         for (int c = 0; c < PANEL_SIZE; c++) {
@@ -1398,10 +1406,10 @@ static void msm_debug_test() {
             if (pin_high) any_col_high = true;
             else any_col_low = true;
         }
-        Serial.print("  Columns: low(ON)=");
-        Serial.print(any_col_low ? "YES" : "NO");
-        Serial.print("  high(OFF)=");
-        Serial.println(any_col_high ? "YES" : "NO");
+        Serial.print("  Columns: high(ON)=");
+        Serial.print(any_col_high ? "YES" : "NO");
+        Serial.print("  low(OFF)=");
+        Serial.println(any_col_low ? "YES" : "NO");
 
         Serial.println("  LED should be ON now — holding 5 seconds...");
         delay(5000);
@@ -1435,7 +1443,7 @@ static void msm_debug_test() {
 
     // Read actual pad state (not SIO output register — that only shows SIO's value)
     uint64_t gpio_in = (uint64_t)sio_hw->gpio_hi_in << 32 | sio_hw->gpio_in;
-    bool row0_on = (gpio_in & row_on_mask[0]) != 0;
+    bool row0_on = (gpio_in & row_on_mask[0]) == 0;  // normal polarity: row LOW = active
     Serial.print("  Row 0 (GP");
     Serial.print(ROW_PIN[0]);
     Serial.print(") active? ");
@@ -1479,11 +1487,11 @@ static void msm_debug_test() {
     // Step 3: Single-row bridge test (1 row via DMA + ISR)
     Serial.println("Step 3: Single-row DMA + bridge test");
     {
-        uint32_t pio_col_word = (~col_pattern) & 0xFFFFF;
+        uint32_t pio_col_word = col_pattern & 0xFFFFF;
         // Set up for 1 row only
         dma_col_data[0][0] = pio_col_word;
         dma_col_data[0][1] = 0;  // min delay
-        uint32_t one_row_pattern[2] = { msm_row_patterns[0], 0 }; // row 0 + terminator
+        uint32_t one_row_pattern[2] = { msm_row_patterns[0], 0x00FFFFFFu }; // row 0 + all-OFF terminator (normal polarity)
 
         msm_all_pins_to_pio();
 
@@ -1500,7 +1508,7 @@ static void msm_debug_test() {
         pio_interrupt_clear(msm_col_pio, 1);
 
         // Init col SM: push all-OFF mask
-        pio_sm_put_blocking(msm_col_pio, msm_col_sm, 0xFFFFF);
+        pio_sm_put_blocking(msm_col_pio, msm_col_sm, 0x00000);  // all cols OFF under normal polarity
 
         // Configure DMA for 1 row
         dma_channel_config rc = dma_channel_get_default_config(msm_ch_row);
@@ -1569,7 +1577,7 @@ static void msm_debug_test() {
     // Step 4: Full scan frame with long ON — read GPIO mid-frame
     Serial.println("Step 4: Scan frame GPIO check (ON=500us, row 0)");
     {
-        uint32_t pio_col_word = (~col_pattern) & 0xFFFFF;
+        uint32_t pio_col_word = col_pattern & 0xFFFFF;
         // 500us ON = 75000 cycles at 150MHz. Overhead = 5. Delay = 74995.
         uint32_t long_delay = 74995;
         dma_col_data[0][0] = pio_col_word;
@@ -1590,7 +1598,7 @@ static void msm_debug_test() {
         pio_interrupt_clear(msm_col_pio, 0);
         pio_interrupt_clear(msm_col_pio, 1);
 
-        pio_sm_put_blocking(msm_col_pio, msm_col_sm, 0xFFFFF);
+        pio_sm_put_blocking(msm_col_pio, msm_col_sm, 0x00000);  // all cols OFF under normal polarity
 
         // Configure DMA for 1 row (no terminator)
         dma_channel_set_read_addr(msm_ch_row, &one_pattern, false);
@@ -1650,7 +1658,7 @@ static void msm_debug_test() {
     // Step 5: Full 20-row scan for 5 seconds (visual verification)
     Serial.println("Step 5: Full panel scan — all rows, 5 seconds (watch the panel!)");
     {
-        uint32_t pio_col_word = (~col_pattern) & 0xFFFFF;
+        uint32_t pio_col_word = col_pattern & 0xFFFFF;
         // 10us ON per row → ~200us/frame → ~5000 fps
         uint32_t vis_delay = (uint32_t)(10.0f * cycles_per_us) - MSM_COL_ON_OVERHEAD;
         for (int r = 0; r < active_rows; r++) {
@@ -1702,7 +1710,7 @@ static void __attribute__((noinline)) __not_in_flash_func(run_burst_scan)(
 
     precompute_scan_masks();
 
-    uint32_t pio_col_word = (~col_pattern) & 0xFFFFF;
+    uint32_t pio_col_word = col_pattern & 0xFFFFF;
     uint32_t pio_delay = (on_cycles > PIO_ON_OVERHEAD_CYCLES)
                        ? (on_cycles - PIO_ON_OVERHEAD_CYCLES) : 0;
 
@@ -1718,17 +1726,17 @@ static void __attribute__((noinline)) __not_in_flash_func(run_burst_scan)(
     pio_sm_set_enabled(pio_hw_inst, pio_sm_idx, true);
 
     // Push all-OFF mask for Y register init
-    pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, 0xFFFFF);
+    pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, 0x00000);  // all cols OFF under normal polarity
 
     // Warm-up frame (with interrupts disabled)
     noInterrupts();
     for (int r = 0; r < active_rows; r++) {
-        gpio_set_mask64(row_on_mask[r]);
+        gpio_clr_mask64(row_on_mask[r]);
         pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, pio_col_word);
         pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, pio_delay);
         while (!pio_interrupt_get(pio_hw_inst, 0)) {}
         pio_interrupt_clear(pio_hw_inst, 0);
-        gpio_clr_mask64(row_on_mask[r]);
+        gpio_set_mask64(row_on_mask[r]);
     }
     interrupts();
 
@@ -1748,12 +1756,12 @@ static void __attribute__((noinline)) __not_in_flash_func(run_burst_scan)(
         uint32_t frame_start = m33_hw->dwt_cyccnt;
 
         for (int r = 0; r < active_rows; r++) {
-            gpio_set_mask64(row_on_mask[r]);
+            gpio_clr_mask64(row_on_mask[r]);
             pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, pio_col_word);
             pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, pio_delay);
             while (!pio_interrupt_get(pio_hw_inst, 0)) {}
             pio_interrupt_clear(pio_hw_inst, 0);
-            gpio_clr_mask64(row_on_mask[r]);
+            gpio_set_mask64(row_on_mask[r]);
         }
 
         uint32_t frame_end = m33_hw->dwt_cyccnt;
@@ -1905,18 +1913,18 @@ static void __attribute__((noinline)) __not_in_flash_func(run_bcm_burst_pio)(
     pio_sm_set_enabled(pio_hw_inst, pio_sm_idx, true);
 
     // Push all-OFF mask for Y register init
-    pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, 0xFFFFF);
+    pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, 0x00000);  // all cols OFF under normal polarity
 
     // Warm-up: one row with all bit-planes
     noInterrupts();
-    gpio_set_mask64(row_on_mask[0]);
+    gpio_clr_mask64(row_on_mask[0]);
     for (int b = 0; b < bcm_bits; b++) {
         pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, bcm_plane_data[0][bcm_bit(b)][0]);
         pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, bcm_plane_data[0][bcm_bit(b)][1]);
         while (!pio_interrupt_get(pio_hw_inst, 0)) {}
         pio_interrupt_clear(pio_hw_inst, 0);
     }
-    gpio_clr_mask64(row_on_mask[0]);
+    gpio_set_mask64(row_on_mask[0]);
     interrupts();
 
     // Lock out Core 1 — eliminates bus contention from USB stack.
@@ -1931,14 +1939,14 @@ static void __attribute__((noinline)) __not_in_flash_func(run_bcm_burst_pio)(
         for (uint32_t w = 0; w < 100; w++) {
             while ((m33_hw->dwt_cyccnt - wu_start) < trigger_period_cyc) {}
             wu_start += trigger_period_cyc;
-            gpio_set_mask64(row_on_mask[wr]);
+            gpio_clr_mask64(row_on_mask[wr]);
             for (int b = 0; b < bcm_bits; b++) {
                 pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, bcm_plane_data[wr][bcm_bit(b)][0]);
                 pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, bcm_plane_data[wr][bcm_bit(b)][1]);
                 while (!pio_interrupt_get(pio_hw_inst, 0)) {}
                 pio_interrupt_clear(pio_hw_inst, 0);
             }
-            gpio_clr_mask64(row_on_mask[wr]);
+            gpio_set_mask64(row_on_mask[wr]);
             wr++;
             if (wr >= active_rows) wr = 0;
         }
@@ -1965,14 +1973,14 @@ static void __attribute__((noinline)) __not_in_flash_func(run_bcm_burst_pio)(
         if (trig_mode == TRIG_EXT) noInterrupts();
         uint32_t burst_start = m33_hw->dwt_cyccnt;
 
-        gpio_set_mask64(row_on_mask[row]);
+        gpio_clr_mask64(row_on_mask[row]);
         for (int b = 0; b < bcm_bits; b++) {
             pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, bcm_plane_data[row][bcm_bit(b)][0]);
             pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, bcm_plane_data[row][bcm_bit(b)][1]);
             while (!pio_interrupt_get(pio_hw_inst, 0)) {}
             pio_interrupt_clear(pio_hw_inst, 0);
         }
-        gpio_clr_mask64(row_on_mask[row]);
+        gpio_set_mask64(row_on_mask[row]);
 
         uint32_t burst_end = m33_hw->dwt_cyccnt;
         if (trig_mode == TRIG_EXT) interrupts();
@@ -2027,7 +2035,7 @@ static void __attribute__((noinline)) __not_in_flash_func(run_bcm_burst_dma)(
     pio_sm_exec(pio_hw_inst, pio_sm_idx, pio_encode_jmp(pio_offset));
     pio_interrupt_clear(pio_hw_inst, 0);
     pio_sm_set_enabled(pio_hw_inst, pio_sm_idx, true);
-    pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, 0xFFFFF);
+    pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, 0x00000);  // all cols OFF under normal polarity
 
     // Claim DMA channel for feeding PIO TX FIFO
     int dma_ch = dma_claim_unused_channel(false);
@@ -2045,14 +2053,14 @@ static void __attribute__((noinline)) __not_in_flash_func(run_bcm_burst_dma)(
 
     // Warm-up
     noInterrupts();
-    gpio_set_mask64(row_on_mask[0]);
+    gpio_clr_mask64(row_on_mask[0]);
     for (int b = 0; b < bcm_bits; b++) {
         pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, bcm_plane_data[0][bcm_bit(b)][0]);
         pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, bcm_plane_data[0][bcm_bit(b)][1]);
         while (!pio_interrupt_get(pio_hw_inst, 0)) {}
         pio_interrupt_clear(pio_hw_inst, 0);
     }
-    gpio_clr_mask64(row_on_mask[0]);
+    gpio_set_mask64(row_on_mask[0]);
     interrupts();
 
     // Main trigger loop
@@ -2066,7 +2074,7 @@ static void __attribute__((noinline)) __not_in_flash_func(run_bcm_burst_dma)(
         noInterrupts();
         uint32_t burst_start = m33_hw->dwt_cyccnt;
 
-        gpio_set_mask64(row_on_mask[row]);
+        gpio_clr_mask64(row_on_mask[row]);
 
         // Start DMA: feed all bit-plane data to PIO TX FIFO
         dma_channel_configure(dma_ch, &dma_cfg,
@@ -2081,7 +2089,7 @@ static void __attribute__((noinline)) __not_in_flash_func(run_bcm_burst_dma)(
             pio_interrupt_clear(pio_hw_inst, 0);
         }
 
-        gpio_clr_mask64(row_on_mask[row]);
+        gpio_set_mask64(row_on_mask[row]);
         uint32_t burst_end = m33_hw->dwt_cyccnt;
         interrupts();
 
@@ -2140,7 +2148,7 @@ static void __attribute__((noinline)) __not_in_flash_func(run_bcm_burst_msm)(
     pio_sm_exec(pio_hw_inst, pio_sm_idx, pio_encode_jmp(pio_offset));
     pio_interrupt_clear(pio_hw_inst, 0);
     pio_sm_set_enabled(pio_hw_inst, pio_sm_idx, true);
-    pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, 0xFFFFF);
+    pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, 0x00000);  // all cols OFF under normal polarity
 
     // DMA channel
     int dma_ch = dma_claim_unused_channel(false);
@@ -2158,7 +2166,7 @@ static void __attribute__((noinline)) __not_in_flash_func(run_bcm_burst_msm)(
 
     // Warm-up
     noInterrupts();
-    gpio_set_mask64(row_on_mask[0]);
+    gpio_clr_mask64(row_on_mask[0]);
     dma_channel_configure(dma_ch, &dma_cfg,
         &pio_hw_inst->txf[pio_sm_idx], &bcm_plane_data[0][0][0],
         bcm_bits * 2, true);
@@ -2166,7 +2174,7 @@ static void __attribute__((noinline)) __not_in_flash_func(run_bcm_burst_msm)(
         while (!pio_interrupt_get(pio_hw_inst, 0)) {}
         pio_interrupt_clear(pio_hw_inst, 0);
     }
-    gpio_clr_mask64(row_on_mask[0]);
+    gpio_set_mask64(row_on_mask[0]);
     interrupts();
 
     // Main trigger loop
@@ -2180,7 +2188,7 @@ static void __attribute__((noinline)) __not_in_flash_func(run_bcm_burst_msm)(
         noInterrupts();
         uint32_t burst_start = m33_hw->dwt_cyccnt;
 
-        gpio_set_mask64(row_on_mask[row]);
+        gpio_clr_mask64(row_on_mask[row]);
 
         // DMA feeds all bit-plane data
         dma_channel_configure(dma_ch, &dma_cfg,
@@ -2193,7 +2201,7 @@ static void __attribute__((noinline)) __not_in_flash_func(run_bcm_burst_msm)(
             pio_interrupt_clear(pio_hw_inst, 0);
         }
 
-        gpio_clr_mask64(row_on_mask[row]);
+        gpio_set_mask64(row_on_mask[row]);
         uint32_t burst_end = m33_hw->dwt_cyccnt;
         interrupts();
 
@@ -2510,7 +2518,7 @@ static void cmd_bcmdemo() {
     pio_sm_exec(pio_hw_inst, pio_sm_idx, pio_encode_jmp(pio_offset));
     pio_interrupt_clear(pio_hw_inst, 0);
     pio_sm_set_enabled(pio_hw_inst, pio_sm_idx, true);
-    pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, 0xFFFFF);
+    pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, 0x00000);  // all cols OFF under normal polarity
 
     // Warm-up frame
     for (int r = 0; r < PANEL_SIZE; r++)
@@ -2518,14 +2526,14 @@ static void cmd_bcmdemo() {
             pixel_data[r][c] = 0;
     precompute_bcm_data();
     noInterrupts();
-    gpio_set_mask64(row_on_mask[0]);
+    gpio_clr_mask64(row_on_mask[0]);
     for (int b = 0; b < bcm_bits; b++) {
         pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, bcm_plane_data[0][bcm_bit(b)][0]);
         pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, bcm_plane_data[0][bcm_bit(b)][1]);
         while (!pio_interrupt_get(pio_hw_inst, 0)) {}
         pio_interrupt_clear(pio_hw_inst, 0);
     }
-    gpio_clr_mask64(row_on_mask[0]);
+    gpio_set_mask64(row_on_mask[0]);
     interrupts();
 
     // Ramp through each intensity level
@@ -2554,14 +2562,14 @@ static void cmd_bcmdemo() {
             for (uint8_t r = 0; r < active_rows; r++) {
                 uint32_t burst_start = m33_hw->dwt_cyccnt;
 
-                gpio_set_mask64(row_on_mask[r]);
+                gpio_clr_mask64(row_on_mask[r]);
                 for (int b = 0; b < bcm_bits; b++) {
                     pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, bcm_plane_data[r][bcm_bit(b)][0]);
                     pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, bcm_plane_data[r][bcm_bit(b)][1]);
                     while (!pio_interrupt_get(pio_hw_inst, 0)) {}
                     pio_interrupt_clear(pio_hw_inst, 0);
                 }
-                gpio_clr_mask64(row_on_mask[r]);
+                gpio_set_mask64(row_on_mask[r]);
 
                 uint32_t burst_end = m33_hw->dwt_cyccnt;
                 stats_update(burst_end - burst_start, 0);
@@ -2643,14 +2651,14 @@ static void __attribute__((noinline)) __not_in_flash_func(run_bcm_visual_level)(
         for (uint32_t w = 0; w < 100; w++) {
             while ((m33_hw->dwt_cyccnt - wu_start) < trigger_period_cyc) {}
             wu_start += trigger_period_cyc;
-            gpio_set_mask64(row_on_mask[wr]);
+            gpio_clr_mask64(row_on_mask[wr]);
             for (int b = 0; b < bcm_bits; b++) {
                 pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, bcm_plane_data[wr][bcm_bit(b)][0]);
                 pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, bcm_plane_data[wr][bcm_bit(b)][1]);
                 while (!pio_interrupt_get(pio_hw_inst, 0)) {}
                 pio_interrupt_clear(pio_hw_inst, 0);
             }
-            gpio_clr_mask64(row_on_mask[wr]);
+            gpio_set_mask64(row_on_mask[wr]);
             wr++;
             if (wr >= active_rows) wr = 0;
         }
@@ -2688,14 +2696,14 @@ static void __attribute__((noinline)) __not_in_flash_func(run_bcm_visual_level)(
         // --- BURST PHASE: one row, all bit-planes ---
         uint32_t burst_start = m33_hw->dwt_cyccnt;
 
-        gpio_set_mask64(row_on_mask[row]);
+        gpio_clr_mask64(row_on_mask[row]);
         for (int b = 0; b < bcm_bits; b++) {
             pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, bcm_plane_data[row][bcm_bit(b)][0]);
             pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, bcm_plane_data[row][bcm_bit(b)][1]);
             while (!pio_interrupt_get(pio_hw_inst, 0)) {}
             pio_interrupt_clear(pio_hw_inst, 0);
         }
-        gpio_clr_mask64(row_on_mask[row]);
+        gpio_set_mask64(row_on_mask[row]);
 
         uint32_t burst_end = m33_hw->dwt_cyccnt;
         interrupts();
@@ -2761,7 +2769,7 @@ static void cmd_bcmvisual(const char* arg) {
     pio_sm_exec(pio_hw_inst, pio_sm_idx, pio_encode_jmp(pio_offset));
     pio_interrupt_clear(pio_hw_inst, 0);
     pio_sm_set_enabled(pio_hw_inst, pio_sm_idx, true);
-    pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, 0xFFFFF);
+    pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, 0x00000);  // all cols OFF under normal polarity
 
     Serial.println("--- BCMVISUAL START ---");
     Serial.print("BCM bits=");
@@ -2899,7 +2907,7 @@ static void __attribute__((noinline)) __not_in_flash_func(run_ramburst)(
     pio_sm_exec(pio_hw_inst, pio_sm_idx, pio_encode_jmp(pio_offset));
     pio_interrupt_clear(pio_hw_inst, 0);
     pio_sm_set_enabled(pio_hw_inst, pio_sm_idx, true);
-    pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, 0xFFFFF);
+    pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, 0x00000);  // all cols OFF under normal polarity
 
     // Lock out Core 1
     multicore_lockout_start_blocking();
@@ -2912,14 +2920,14 @@ static void __attribute__((noinline)) __not_in_flash_func(run_ramburst)(
         for (uint32_t w = 0; w < 100; w++) {
             while ((m33_hw->dwt_cyccnt - wu_start) < trigger_period_cyc) {}
             wu_start += trigger_period_cyc;
-            gpio_set_mask64(row_on_mask[wr]);
+            gpio_clr_mask64(row_on_mask[wr]);
             for (int b = 0; b < bcm_bits; b++) {
                 pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, bcm_plane_data[wr][bcm_bit(b)][0]);
                 pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, bcm_plane_data[wr][bcm_bit(b)][1]);
                 while (!pio_interrupt_get(pio_hw_inst, 0)) {}
                 pio_interrupt_clear(pio_hw_inst, 0);
             }
-            gpio_clr_mask64(row_on_mask[wr]);
+            gpio_set_mask64(row_on_mask[wr]);
             wr++;
             if (wr >= active_rows) wr = 0;
         }
@@ -2982,14 +2990,14 @@ static void __attribute__((noinline)) __not_in_flash_func(run_ramburst)(
         // --- BURST PHASE: one row, all bit-planes ---
         uint32_t burst_start = m33_hw->dwt_cyccnt;
 
-        gpio_set_mask64(row_on_mask[row]);
+        gpio_clr_mask64(row_on_mask[row]);
         for (int b = 0; b < bcm_bits; b++) {
             pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, bcm_plane_data[row][bcm_bit(b)][0]);
             pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, bcm_plane_data[row][bcm_bit(b)][1]);
             while (!pio_interrupt_get(pio_hw_inst, 0)) {}
             pio_interrupt_clear(pio_hw_inst, 0);
         }
-        gpio_clr_mask64(row_on_mask[row]);
+        gpio_set_mask64(row_on_mask[row]);
 
         uint32_t burst_end = m33_hw->dwt_cyccnt;
         interrupts();
@@ -3263,7 +3271,7 @@ static void cmd_photocal(const char* arg) {
     pio_sm_exec(pio_hw_inst, pio_sm_idx, pio_encode_jmp(pio_offset));
     pio_interrupt_clear(pio_hw_inst, 0);
     pio_sm_set_enabled(pio_hw_inst, pio_sm_idx, true);
-    pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, 0xFFFFF);
+    pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, 0x00000);  // all cols OFF under normal polarity
 
     // Compute outlier threshold
     uint32_t base_cycles = (uint32_t)(bcm_base_on_us * cycles_per_us);
@@ -3292,14 +3300,14 @@ static void cmd_photocal(const char* arg) {
         for (int w = 0; w < 100; w++) {
             while ((m33_hw->dwt_cyccnt - warmup_start) < trigger_period_cyc) {}
             warmup_start += trigger_period_cyc;
-            gpio_set_mask64(row_on_mask[warmup_row]);
+            gpio_clr_mask64(row_on_mask[warmup_row]);
             for (int b = 0; b < bcm_bits; b++) {
                 pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, bcm_plane_data[warmup_row][bcm_bit(b)][0]);
                 pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, bcm_plane_data[warmup_row][bcm_bit(b)][1]);
                 while (!pio_interrupt_get(pio_hw_inst, 0)) {}
                 pio_interrupt_clear(pio_hw_inst, 0);
             }
-            gpio_clr_mask64(row_on_mask[warmup_row]);
+            gpio_set_mask64(row_on_mask[warmup_row]);
             warmup_row++;
             if (warmup_row >= active_rows) warmup_row = 0;
         }
@@ -3320,14 +3328,14 @@ static void cmd_photocal(const char* arg) {
             noInterrupts();
             uint32_t frame_start = m33_hw->dwt_cyccnt;
             for (uint8_t row = 0; row < active_rows; row++) {
-                gpio_set_mask64(row_on_mask[row]);
+                gpio_clr_mask64(row_on_mask[row]);
                 for (int b = 0; b < bcm_bits; b++) {
                     pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, bcm_plane_data[row][bcm_bit(b)][0]);
                     pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, bcm_plane_data[row][bcm_bit(b)][1]);
                     while (!pio_interrupt_get(pio_hw_inst, 0)) {}
                     pio_interrupt_clear(pio_hw_inst, 0);
                 }
-                gpio_clr_mask64(row_on_mask[row]);
+                gpio_set_mask64(row_on_mask[row]);
             }
             uint32_t frame_end = m33_hw->dwt_cyccnt;
             interrupts();
@@ -3401,16 +3409,16 @@ static void update_led_pins() {
 }
 
 static void all_off() {
-    // All columns HIGH (OFF), all rows LOW (OFF)
-    gpio_set_mask64(all_col_mask);
+    // Normal polarity: all columns LOW (OFF), all rows HIGH (OFF)
+    gpio_clr_mask64(all_col_mask);
     for (int r = 0; r < PANEL_SIZE; r++) {
         gpio_clr_mask64(row_on_mask[r]);
     }
 }
 
 static void led_off() {
-    gpio_put(active_col_pin, 1);
-    gpio_put(active_row_pin, 0);
+    gpio_put(active_col_pin, 0);  // col LOW = OFF (normal polarity)
+    gpio_put(active_row_pin, 1);  // row HIGH = OFF
 }
 
 // ---------------------------------------------------------------------------
@@ -3423,14 +3431,14 @@ static void __attribute__((noinline)) __not_in_flash_func(run_n_pulses)(uint32_t
         return;
     }
 
-    // Warm-up pulse
+    // Warm-up pulse (normal polarity: col HIGH + row LOW = ON)
     {
         if (mode == 0) noInterrupts();
-        gpio_put(active_col_pin, 0);
-        gpio_put(active_row_pin, 1);
-        dwt_delay_cycles(on_cycles);
         gpio_put(active_col_pin, 1);
         gpio_put(active_row_pin, 0);
+        dwt_delay_cycles(on_cycles);
+        gpio_put(active_col_pin, 0);
+        gpio_put(active_row_pin, 1);
         dwt_delay_cycles(off_cycles);
         if (mode == 0) interrupts();
     }
@@ -3439,12 +3447,12 @@ static void __attribute__((noinline)) __not_in_flash_func(run_n_pulses)(uint32_t
         if (mode == 0) noInterrupts();
 
         uint32_t start_cyc = m33_hw->dwt_cyccnt;
-        gpio_put(active_col_pin, 0);
-        gpio_put(active_row_pin, 1);
-        dwt_delay_cycles(on_cycles);
-        uint32_t mid_cyc = m33_hw->dwt_cyccnt;
         gpio_put(active_col_pin, 1);
         gpio_put(active_row_pin, 0);
+        dwt_delay_cycles(on_cycles);
+        uint32_t mid_cyc = m33_hw->dwt_cyccnt;
+        gpio_put(active_col_pin, 0);
+        gpio_put(active_row_pin, 1);
         dwt_delay_cycles(off_cycles);
         uint32_t end_cyc = m33_hw->dwt_cyccnt;
 
@@ -3475,12 +3483,12 @@ static void __attribute__((noinline)) __not_in_flash_func(run_rowtime)(uint32_t 
     // Warm-up
     noInterrupts();
     for (int r = 0; r < active_rows; r++) {
-        gpio_set_mask64(col_off_mask);
-        gpio_clr_mask64(col_on_mask);
-        gpio_set_mask64(row_on_mask[r]);
+        gpio_clr_mask64(col_off_mask);
+        gpio_set_mask64(col_on_mask);
         gpio_clr_mask64(row_on_mask[r]);
+        gpio_set_mask64(row_on_mask[r]);
     }
-    gpio_set_mask64(all_col_mask);
+    gpio_clr_mask64(all_col_mask);
     interrupts();
 
     for (uint32_t i = 0; i < n_iters; i++) {
@@ -3490,19 +3498,19 @@ static void __attribute__((noinline)) __not_in_flash_func(run_rowtime)(uint32_t 
             uint32_t t0 = m33_hw->dwt_cyccnt;
 
             // Set column pattern
-            gpio_set_mask64(col_off_mask);   // OFF columns HIGH
-            gpio_clr_mask64(col_on_mask);    // ON columns LOW
+            gpio_clr_mask64(col_off_mask);   // OFF columns LOW (normal polarity)
+            gpio_set_mask64(col_on_mask);    // ON columns HIGH
 
             // Enable row
-            gpio_set_mask64(row_on_mask[r]);
+            gpio_clr_mask64(row_on_mask[r]);
 
             // NO delay — measuring overhead only
 
             // Disable row
-            gpio_clr_mask64(row_on_mask[r]);
+            gpio_set_mask64(row_on_mask[r]);
 
             // All columns OFF
-            gpio_set_mask64(all_col_mask);
+            gpio_clr_mask64(all_col_mask);
 
             uint32_t t1 = m33_hw->dwt_cyccnt;
 
@@ -3528,12 +3536,12 @@ static void __attribute__((noinline)) __not_in_flash_func(run_scan_frames)(uint3
     // Warm-up frame
     noInterrupts();
     for (int r = 0; r < active_rows; r++) {
-        gpio_set_mask64(col_off_mask);
-        gpio_clr_mask64(col_on_mask);
-        gpio_set_mask64(row_on_mask[r]);
-        dwt_delay_cycles(on_cycles);
+        gpio_clr_mask64(col_off_mask);
+        gpio_set_mask64(col_on_mask);
         gpio_clr_mask64(row_on_mask[r]);
-        gpio_set_mask64(all_col_mask);
+        dwt_delay_cycles(on_cycles);
+        gpio_set_mask64(row_on_mask[r]);
+        gpio_clr_mask64(all_col_mask);
     }
     interrupts();
 
@@ -3543,20 +3551,20 @@ static void __attribute__((noinline)) __not_in_flash_func(run_scan_frames)(uint3
 
         for (int r = 0; r < active_rows; r++) {
             // Set column pattern for this row
-            gpio_set_mask64(col_off_mask);   // OFF columns HIGH
-            gpio_clr_mask64(col_on_mask);    // ON columns LOW
+            gpio_clr_mask64(col_off_mask);   // OFF columns LOW (normal polarity)
+            gpio_set_mask64(col_on_mask);    // ON columns HIGH
 
             // Enable row
-            gpio_set_mask64(row_on_mask[r]);
+            gpio_clr_mask64(row_on_mask[r]);
 
             // Hold for on_cycles
             dwt_delay_cycles(on_cycles);
 
             // Disable row
-            gpio_clr_mask64(row_on_mask[r]);
+            gpio_set_mask64(row_on_mask[r]);
 
             // All columns OFF between rows
-            gpio_set_mask64(all_col_mask);
+            gpio_clr_mask64(all_col_mask);
         }
 
         uint32_t frame_end = m33_hw->dwt_cyccnt;
@@ -3594,7 +3602,7 @@ static void __attribute__((noinline)) __not_in_flash_func(run_pio_rowtime)(uint3
     precompute_scan_masks();
 
     // Pre-invert column pattern for PIO (1=HIGH=OFF, 0=LOW=ON)
-    uint32_t pio_col_word = (~col_pattern) & 0xFFFFF;
+    uint32_t pio_col_word = col_pattern & 0xFFFFF;
 
     // Reset and enable PIO SM (restart clears pindirs on RP2350, so re-set them)
     pio_sm_set_enabled(pio_hw_inst, pio_sm_idx, false);
@@ -3606,28 +3614,28 @@ static void __attribute__((noinline)) __not_in_flash_func(run_pio_rowtime)(uint3
     pio_sm_set_enabled(pio_hw_inst, pio_sm_idx, true);
 
     // Push all-OFF mask for Y register init
-    pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, 0xFFFFF);
+    pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, 0x00000);  // all cols OFF under normal polarity
 
     // Warm-up iteration
     for (int r = 0; r < active_rows; r++) {
-        gpio_set_mask64(row_on_mask[r]);
+        gpio_clr_mask64(row_on_mask[r]);
         pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, pio_col_word);
         pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, 0);  // min delay
         while (!pio_interrupt_get(pio_hw_inst, 0)) {}
         pio_interrupt_clear(pio_hw_inst, 0);
-        gpio_clr_mask64(row_on_mask[r]);
+        gpio_set_mask64(row_on_mask[r]);
     }
 
     for (uint32_t i = 0; i < n_iters; i++) {
         for (int r = 0; r < active_rows; r++) {
             uint32_t t0 = m33_hw->dwt_cyccnt;
 
-            gpio_set_mask64(row_on_mask[r]);
+            gpio_clr_mask64(row_on_mask[r]);
             pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, pio_col_word);
             pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, 0);  // min delay
             while (!pio_interrupt_get(pio_hw_inst, 0)) {}
             pio_interrupt_clear(pio_hw_inst, 0);
-            gpio_clr_mask64(row_on_mask[r]);
+            gpio_set_mask64(row_on_mask[r]);
 
             uint32_t t1 = m33_hw->dwt_cyccnt;
             stats_update(t1 - t0, 0);
@@ -3648,7 +3656,7 @@ static void __attribute__((noinline)) __not_in_flash_func(run_pio_scan_frames)(u
 
     precompute_scan_masks();
 
-    uint32_t pio_col_word = (~col_pattern) & 0xFFFFF;
+    uint32_t pio_col_word = col_pattern & 0xFFFFF;
     uint32_t pio_delay = (on_cycles > PIO_ON_OVERHEAD_CYCLES)
                        ? (on_cycles - PIO_ON_OVERHEAD_CYCLES) : 0;
 
@@ -3662,16 +3670,16 @@ static void __attribute__((noinline)) __not_in_flash_func(run_pio_scan_frames)(u
     pio_sm_set_enabled(pio_hw_inst, pio_sm_idx, true);
 
     // Push all-OFF mask for Y register init
-    pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, 0xFFFFF);
+    pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, 0x00000);  // all cols OFF under normal polarity
 
     // Warm-up frame
     for (int r = 0; r < active_rows; r++) {
-        gpio_set_mask64(row_on_mask[r]);
+        gpio_clr_mask64(row_on_mask[r]);
         pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, pio_col_word);
         pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, pio_delay);
         while (!pio_interrupt_get(pio_hw_inst, 0)) {}
         pio_interrupt_clear(pio_hw_inst, 0);
-        gpio_clr_mask64(row_on_mask[r]);
+        gpio_set_mask64(row_on_mask[r]);
     }
 
     for (uint32_t f = 0; f < n_frames; f++) {
@@ -3679,12 +3687,12 @@ static void __attribute__((noinline)) __not_in_flash_func(run_pio_scan_frames)(u
         uint32_t frame_start = m33_hw->dwt_cyccnt;
 
         for (int r = 0; r < active_rows; r++) {
-            gpio_set_mask64(row_on_mask[r]);
+            gpio_clr_mask64(row_on_mask[r]);
             pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, pio_col_word);
             pio_sm_put_blocking(pio_hw_inst, pio_sm_idx, pio_delay);
             while (!pio_interrupt_get(pio_hw_inst, 0)) {}
             pio_interrupt_clear(pio_hw_inst, 0);
-            gpio_clr_mask64(row_on_mask[r]);
+            gpio_set_mask64(row_on_mask[r]);
         }
 
         uint32_t frame_end = m33_hw->dwt_cyccnt;
@@ -4471,7 +4479,7 @@ void setup() {
         COL_PIN_mask |= (uint64_t(1) << COL_PIN[i]);
     }
     gpio_set_dir_out_masked64(COL_PIN_mask);
-    gpio_set_mask64(COL_PIN_mask);  // all columns HIGH (OFF)
+    gpio_clr_mask64(COL_PIN_mask);  // all columns LOW (OFF — normal polarity)
 
     uint64_t ROW_PIN_mask = 0;
     for (size_t i = 0; i < PANEL_SIZE; i++) {
@@ -4479,7 +4487,7 @@ void setup() {
         ROW_PIN_mask |= (uint64_t(1) << ROW_PIN[i]);
     }
     gpio_set_dir_out_masked64(ROW_PIN_mask);
-    gpio_clr_mask64(ROW_PIN_mask);  // all rows LOW (OFF)
+    gpio_set_mask64(ROW_PIN_mask);  // all rows HIGH (OFF — normal polarity)
 
     // External trigger input (GP45 bodge wire)
     gpio_init(EINT_PIN);
@@ -4528,8 +4536,8 @@ void loop() {
         noInterrupts();
 
         start_cyc = m33_hw->dwt_cyccnt;
-        gpio_put(active_col_pin, 0);
-        gpio_put(active_row_pin, 1);
+        gpio_put(active_col_pin, 1);  // ON (col HIGH)
+        gpio_put(active_row_pin, 0);  // ON (row LOW)
 
         if (dwt_available) {
             dwt_delay_cycles(on_cycles);
@@ -4538,8 +4546,8 @@ void loop() {
         }
 
         mid_cyc = m33_hw->dwt_cyccnt;
-        gpio_put(active_col_pin, 1);
-        gpio_put(active_row_pin, 0);
+        gpio_put(active_col_pin, 0);  // OFF (col LOW)
+        gpio_put(active_row_pin, 1);  // OFF (row HIGH)
 
         if (dwt_available) {
             dwt_delay_cycles(off_cycles);

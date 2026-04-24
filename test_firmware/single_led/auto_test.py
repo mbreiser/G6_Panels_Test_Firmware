@@ -27,6 +27,7 @@ Usage:
 
 import serial
 import serial.tools.list_ports
+import shutil
 import subprocess
 import sys
 import os
@@ -40,11 +41,43 @@ from status_dashboard import update_status, clear_log
 
 # Configuration
 PROJECT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)))
-FIRMWARE_UF2 = os.path.join(PROJECT_DIR, ".pio/build/pico/firmware.uf2")
-PIO_BIN = os.path.expanduser("~/.platformio/penv/bin/pio")
 BAUD = 115200
 SERIAL_TIMEOUT = 2
 RESULTS_FILE = os.path.join(PROJECT_DIR, "burst_results.json")
+
+# Target hardware revision — set by --rev flag or G6_REV env var.
+# Valid values: "21" (v0.2.1) or "31" (v0.3.1). Maps to PlatformIO envs
+# pico_v021 and pico_v031 respectively.
+PANEL_REV = None       # "21" or "31" once resolved
+ENV_NAME = None        # e.g. "pico_v021"
+FIRMWARE_UF2 = None    # resolved from ENV_NAME
+
+
+def resolve_pio_bin():
+    candidates = [
+        os.path.expanduser("~/.platformio/penv/bin/pio"),
+    ]
+    which = shutil.which("pio")
+    if which:
+        candidates.append(which)
+    for p in candidates:
+        if p and os.path.exists(p):
+            return p
+    return "pio"  # last-resort fallback (will fail loudly if missing)
+
+
+PIO_BIN = resolve_pio_bin()
+
+
+def set_rev(rev):
+    """Set the target panel revision and derive env / UF2 paths."""
+    global PANEL_REV, ENV_NAME, FIRMWARE_UF2
+    rev = str(rev)
+    if rev not in ("21", "31"):
+        raise ValueError(f"Invalid --rev {rev!r}. Must be '21' (v0.2.1) or '31' (v0.3.1).")
+    PANEL_REV = rev
+    ENV_NAME = f"pico_v0{rev}"  # "21" -> pico_v021, "31" -> pico_v031
+    FIRMWARE_UF2 = os.path.join(PROJECT_DIR, ".pio/build", ENV_NAME, "firmware.uf2")
 
 # ── Serial helpers ──────────────────────────────────────────────────────────
 
@@ -143,14 +176,18 @@ def send_command(ser, cmd, timeout=30, wait_for=None):
 # ── Build & Flash ───────────────────────────────────────────────────────────
 
 def build():
-    """Build firmware. Returns True on success."""
-    update_status("Building", "pio run")
+    """Build firmware for the selected PANEL_REV. Returns True on success."""
+    if ENV_NAME is None:
+        update_status("BUILD FAILED", "PANEL_REV not set (use --rev 21 or --rev 31)")
+        print("ERROR: PANEL_REV not set. Pass --rev 21 or --rev 31, or set G6_REV env var.", file=sys.stderr)
+        return False
+    update_status("Building", f"pio run -e {ENV_NAME}")
     result = subprocess.run(
-        [PIO_BIN, "run", "-d", PROJECT_DIR],
-        capture_output=True, text=True, timeout=120
+        [PIO_BIN, "run", "-d", PROJECT_DIR, "-e", ENV_NAME],
+        capture_output=True, text=True, timeout=180
     )
     if result.returncode == 0:
-        update_status("Build OK", "firmware ready")
+        update_status("Build OK", f"{ENV_NAME} firmware ready")
         return True
     else:
         update_status("BUILD FAILED", result.stderr[-200:])
@@ -356,8 +393,33 @@ def run_comparison_sweep(ser):
 # ── Main ────────────────────────────────────────────────────────────────────
 
 def main():
-    if len(sys.argv) < 2:
-        print("Usage: python3 auto_test.py <command> [args]")
+    # Parse --rev flag (can appear anywhere in argv). Falls back to G6_REV env.
+    args = list(sys.argv[1:])
+    rev = None
+    i = 0
+    while i < len(args):
+        if args[i] == "--rev" and i + 1 < len(args):
+            rev = args[i + 1]
+            del args[i:i + 2]
+            continue
+        if args[i].startswith("--rev="):
+            rev = args[i].split("=", 1)[1]
+            del args[i]
+            continue
+        i += 1
+    if rev is None:
+        rev = os.environ.get("G6_REV")
+    if rev is not None:
+        try:
+            set_rev(rev)
+        except ValueError as e:
+            print(f"ERROR: {e}", file=sys.stderr)
+            return
+
+    if not args:
+        print("Usage: python3 auto_test.py [--rev 21|31] <command> [args]")
+        print("  Panel revision: --rev 21 (v0.2.1) or --rev 31 (v0.3.1),")
+        print("  or set the G6_REV environment variable.")
         print("Commands:")
         print("  flash              Build and flash firmware")
         print("  cmd <serial_cmd>   Send a single serial command")
@@ -367,7 +429,9 @@ def main():
         return
 
     clear_log()
-    action = sys.argv[1]
+    action = args[0]
+    # Rewrite sys.argv so downstream references (e.g. sys.argv[2:] in cmd) still work.
+    sys.argv = [sys.argv[0]] + args
 
     if action == "flash":
         if not build():
