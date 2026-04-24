@@ -3409,10 +3409,14 @@ static void update_led_pins() {
 }
 
 static void all_off() {
-    // Normal polarity: all columns LOW (OFF), all rows HIGH (OFF)
-    gpio_clr_mask64(all_col_mask);
+    // Normal polarity: all columns LOW (OFF), all rows HIGH (OFF).
+    // NOTE: this function was accidentally double-flipped during the v0.1->v0.2.1
+    // polarity conversion — manually edited in pass 2, then inadvertently swapped
+    // back by the global row_on_mask set<->clr swap in pass 4. Keep explicit
+    // comments here to make intent obvious against any future global rewrites.
+    gpio_clr_mask64(all_col_mask);        // cols LOW  -> all cols OFF
     for (int r = 0; r < PANEL_SIZE; r++) {
-        gpio_clr_mask64(row_on_mask[r]);
+        gpio_set_mask64(row_on_mask[r]);  // rows HIGH -> all rows OFF
     }
 }
 
