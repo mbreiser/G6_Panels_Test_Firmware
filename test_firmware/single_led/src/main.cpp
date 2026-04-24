@@ -1690,6 +1690,236 @@ static void msm_debug_test() {
 }
 
 // ---------------------------------------------------------------------------
+// Phase 4 PIOFULL (v0.3.1 only) — CPU-free dual-PIO scanning
+// ---------------------------------------------------------------------------
+// v0.3.1 has contiguous row pins GP20-39 (no SPI gap), enabling a clean
+// 20-bit PIO row driver on PIO1 (GPIOBASE=16, base GP20). With BOTH rows and
+// columns driven by PIO + DMA DREQ feeds, the MSMSCAN bridge-ISRs can be
+// eliminated entirely — the CPU is free during the scan burst and
+// noInterrupts() is no longer required for zero-jitter operation.
+//
+// Architecture:
+//   - PIO0 col SM (GPIOBASE=0, base GP0): variant of led_col_program with
+//     the terminal `irq wait 0` removed. Pulls [pattern, delay] pairs from
+//     DMA, drives columns, delays, cols-off, wraps. No IRQ signaling.
+//   - PIO1 row SM (GPIOBASE=16, base GP20): pulls [pattern, delay] pairs
+//     from DMA, drives rows, delays, wraps.
+//   - CH_COL: feeds 20 rows × bcm_bits × [pattern, delay] to PIO0 TX FIFO
+//   - CH_ROW: feeds 20 × [pattern, delay] to PIO1 TX FIFO (row delay = sum
+//     of bcm_bits bit-plane durations)
+//   - Both DMAs DREQ-paced by their respective PIO FIFOs. No CPU bridging.
+//   - External GP45 trigger: CPU sets DMA read addrs back to start and
+//     triggers both channels in lockstep (one per microscope line).
+//
+// NOTE: v0.3.1 only. On v0.2.1 the SPI0 gap at GP32-35 breaks the 20-bit
+// contiguous row program and this mode is disabled at compile time.
+// ---------------------------------------------------------------------------
+#if PANEL_REV == 31
+
+// PIOFULL row SM program (PIO1, GPIOBASE=16, out base GP20, out pins 20)
+//   addr 0: pull block    ; get row pattern (inverted one-hot under normal polarity)
+//   addr 1: out pins, 20  ; [wrap target] drive rows (GP20-39)
+//   addr 2: pull block    ; get delay count
+//   addr 3: mov x, osr
+//   addr 4: jmp x--, 4    ; delay loop — holds row for col-burst duration
+//                         ; [wrap] -> addr 1 (pull next row)
+static const uint16_t piofull_row_program_insn[] = {
+    0x80a0, //  0: pull block
+    0x6014, //  1: out pins, 20       [wrap target]
+    0x80a0, //  2: pull block
+    0xa027, //  3: mov x, osr
+    0x0044, //  4: jmp x--, 4
+};
+#define PIOFULL_ROW_WRAP_TARGET 1
+#define PIOFULL_ROW_WRAP        4
+#define PIOFULL_ROW_DELAY_OVERHEAD 5   // pull+out+pull+mov+first jmp = 5 cycles
+
+static const pio_program_t piofull_row_program = {
+    .instructions = piofull_row_program_insn,
+    .length = 5,
+    .origin = -1,
+    .pio_version = 0,
+#if PICO_PIO_VERSION > 0
+    .used_gpio_ranges = 0x06,  // ranges 1+2: GPIO 16-47 (PIO1 GPIOBASE=16)
+#endif
+};
+
+// PIOFULL column SM program (PIO0, GPIOBASE=0, out base GP0, out pins 20)
+// Same as led_col_program (Phase 3b) but with the terminal `irq wait 0`
+// removed — col SM loops autonomously, pulling next [pattern, delay] as
+// soon as DMA provides it.
+//   addr 0: pull block           ; init: get all-OFF mask (0x00000)
+//   addr 1: mov y, osr           ; y = permanent all-OFF
+//   addr 2: pull block    [wrap] ; get column pattern
+//   addr 3: out pins, 20         ; drive columns
+//   addr 4: pull block           ; get delay count
+//   addr 5: mov x, osr
+//   addr 6: jmp x--, 6           ; delay loop
+//   addr 7: mov osr, y           ; restore all-OFF
+//   addr 8: out pins, 20         ; all cols OFF  [wrap] -> addr 2
+static const uint16_t piofull_col_program_insn[] = {
+    0x80a0, //  0: pull block
+    0xa047, //  1: mov y, osr
+    0x80a0, //  2: pull block        [wrap target]
+    0x6014, //  3: out pins, 20
+    0x80a0, //  4: pull block
+    0xa027, //  5: mov x, osr
+    0x0046, //  6: jmp x--, 6
+    0xa0e2, //  7: mov osr, y
+    0x6014, //  8: out pins, 20      [wrap]
+};
+#define PIOFULL_COL_WRAP_TARGET 2
+#define PIOFULL_COL_WRAP        8
+#define PIOFULL_COL_ON_OVERHEAD 5      // pull+mov+jmp_entry+mov+out = 5 cycles
+
+static const pio_program_t piofull_col_program = {
+    .instructions = piofull_col_program_insn,
+    .length = 9,
+    .origin = -1,
+    .pio_version = 0,
+#if PICO_PIO_VERSION > 0
+    .used_gpio_ranges = 0x03,  // ranges 0+1: GPIO 0-31 (PIO0 GPIOBASE=0)
+#endif
+};
+
+// Runtime state
+static PIO  piofull_row_pio   = nullptr;  // PIO1
+static PIO  piofull_col_pio   = nullptr;  // PIO0
+static uint piofull_row_sm    = 0;
+static uint piofull_col_sm    = 0;
+static uint piofull_row_off   = 0;
+static uint piofull_col_off   = 0;
+static bool piofull_loaded    = false;
+
+static int  piofull_ch_row    = -1;
+static int  piofull_ch_col    = -1;
+static bool piofull_dma_claimed = false;
+
+// Release PIOFULL resources (mirrors release_msm_resources but without IRQs).
+static void release_piofull_resources() {
+    if (piofull_loaded) {
+        pio_sm_set_enabled(piofull_row_pio, piofull_row_sm, false);
+        pio_sm_set_enabled(piofull_col_pio, piofull_col_sm, false);
+        pio_remove_program_and_unclaim_sm(&piofull_row_program,
+                                          piofull_row_pio, piofull_row_sm, piofull_row_off);
+        pio_remove_program_and_unclaim_sm(&piofull_col_program,
+                                          piofull_col_pio, piofull_col_sm, piofull_col_off);
+        piofull_row_pio->gpiobase = 0;  // restore default
+        piofull_loaded = false;
+        piofull_row_pio = nullptr;
+        piofull_col_pio = nullptr;
+    }
+    if (piofull_dma_claimed) {
+        dma_channel_abort(piofull_ch_row);
+        dma_channel_abort(piofull_ch_col);
+        dma_channel_unclaim(piofull_ch_row);
+        dma_channel_unclaim(piofull_ch_col);
+        piofull_ch_row = piofull_ch_col = -1;
+        piofull_dma_claimed = false;
+    }
+}
+
+// Row [pattern, delay] pairs: 20 rows × 2 words
+// Pattern is 20-bit inverted one-hot (active row LOW, others HIGH under normal polarity)
+// Delay is sum of column bit-plane durations for that row (in PIO cycles)
+static uint32_t piofull_row_data[PANEL_SIZE * 2];
+
+// Column [pattern, delay] pairs: 20 rows × bcm_bits bit-planes × 2 words
+// Flat-laid: [r0_b0_pat, r0_b0_dly, r0_b1_pat, r0_b1_dly, ..., r19_bN_pat, r19_bN_dly]
+static uint32_t piofull_col_data[PANEL_SIZE * 8 * 2];  // oversize for up to 8 bcm_bits
+
+static void piofull_col_pins_to_pio() {
+    for (int c = 0; c < PANEL_SIZE; c++) pio_gpio_init(piofull_col_pio, COL_PIN[c]);
+}
+static void piofull_row_pins_to_pio() {
+    for (int r = 0; r < PANEL_SIZE; r++) pio_gpio_init(piofull_row_pio, ROW_PIN[r]);
+}
+
+// Precompute row [pattern, delay] pairs from current bcm_plane_data delays.
+// Row delay = sum(bcm_plane_data[r][bit][1]) + overhead × bcm_bits (PIO cycles).
+// Pattern = inverted one-hot on GP20 base (ROW_PIN[r] - 20).
+static void piofull_precompute_row_data() {
+    const uint32_t ALL_ROWS_OFF_20 = 0xFFFFFu;  // 20-bit mask, all rows HIGH
+    for (int r = 0; r < PANEL_SIZE; r++) {
+        piofull_row_data[r * 2 + 0] = ALL_ROWS_OFF_20 & ~(1UL << (ROW_PIN[r] - 20));
+        uint32_t total_delay = 0;
+        for (int b = 0; b < bcm_bits; b++) {
+            // Each col bit-plane: delay word + PIOFULL_COL_ON_OVERHEAD + out-off cycles (~2)
+            total_delay += bcm_plane_data[r][b][1] + PIOFULL_COL_ON_OVERHEAD + 4;
+        }
+        // Subtract row SM's own overhead to align holds
+        uint32_t dly = (total_delay > PIOFULL_ROW_DELAY_OVERHEAD)
+                     ? (total_delay - PIOFULL_ROW_DELAY_OVERHEAD) : 1;
+        piofull_row_data[r * 2 + 1] = dly;
+    }
+}
+
+// Flatten bcm_plane_data into piofull_col_data for DMA streaming.
+static void piofull_precompute_col_data() {
+    uint32_t* dst = piofull_col_data;
+    for (int r = 0; r < PANEL_SIZE; r++) {
+        for (int b = 0; b < bcm_bits; b++) {
+            *dst++ = bcm_plane_data[r][bcm_bit(b)][0];  // pattern
+            *dst++ = bcm_plane_data[r][bcm_bit(b)][1];  // delay
+        }
+    }
+}
+
+// PIOFULL command stub — skeleton for Phase 4. Reports architecture,
+// verifies programs load, and does a basic compile-time sanity check.
+// Full DMA chain + external-trigger + jitter measurement lands in a
+// follow-up commit.
+static void cmd_piofull(const char* arg) {
+    uint32_t n_triggers = 10000;
+    float    rate_hz    = 8000.0f;
+    if (arg && *arg) {
+        int parsed = sscanf(arg, "%u %f", &n_triggers, &rate_hz);
+        if (parsed < 1) {
+            Serial.println("ERR: PIOFULL <N> [rate_hz]");
+            return;
+        }
+    }
+
+    Serial.println("--- PIOFULL (Phase 4 skeleton — v0.3.1 only) ---");
+    Serial.print("  Target: "); Serial.print(n_triggers);
+    Serial.print(" triggers @ "); Serial.print(rate_hz, 1);
+    Serial.println(" Hz");
+    Serial.print("  Row SM: PIO1 GPIOBASE=16, base=GP");
+    Serial.print(ROW_PIN[0]); Serial.println(", out pins 20");
+    Serial.print("  Col SM: PIO0 GPIOBASE=0, base=GP");
+    Serial.print(COL_PIN[0]); Serial.println(", out pins 20");
+    Serial.print("  BCM bits="); Serial.print(bcm_bits);
+    Serial.print("  T="); Serial.print(bcm_base_on_us, 3); Serial.println(" us");
+
+    // Release any previous scan resources before claiming
+    release_phase3bc_resources();
+    release_msm_resources();
+    release_piofull_resources();
+
+    // Precompute data tables from current pixel_data
+    precompute_bcm_data();
+    piofull_precompute_row_data();
+    piofull_precompute_col_data();
+
+    // Per-row burst time (the application uses one row per 8 kHz trigger).
+    uint32_t per_row_delay = piofull_row_data[0 * 2 + 1];  // all rows same delay by design
+    float per_row_us = (float)per_row_delay / cycles_per_us;
+    Serial.print("  Per-row burst: "); Serial.print(per_row_us, 2);
+    Serial.print(" us  (fits 15us? ");
+    Serial.println(per_row_us < 15.0f ? "YES" : "NO");
+    Serial.print("  Col data flattened: ");
+    Serial.print(PANEL_SIZE * bcm_bits * 2);
+    Serial.println(" words");
+
+    Serial.println("NOTE: DMA setup + external trigger loop not yet wired —");
+    Serial.println("      this command currently only validates precompute and layout.");
+    Serial.println("      AD3-measured jitter comes in the next revision.");
+    Serial.println("--- PIOFULL END ---");
+}
+
+#endif // PANEL_REV == 31
+
+// ---------------------------------------------------------------------------
 // Burst-mode scan: simulates 8 kHz external trigger (Phase 3e)
 // ---------------------------------------------------------------------------
 // Simulates the actual 2P microscopy use case:
@@ -3749,6 +3979,10 @@ static void cmd_help() {
     Serial.println("== Multi-SM PIO (Phase 3d) ==");
     Serial.println("MSMSCAN <N>      Multi-SM PIO scan (zero CPU, zero jitter)");
     Serial.println("MSMTEST          Step-by-step multi-SM debug");
+#if PANEL_REV == 31
+    Serial.println("== Full dual-PIO (Phase 4, v0.3.1 only) ==");
+    Serial.println("PIOFULL [N] [Hz] Dual-PIO DMA-chained scan (skeleton — no DMA yet)");
+#endif
     Serial.println("== Burst Mode (2P sync simulation) ==");
     Serial.println("BURST <N> [Hz]   Burst scan at trigger rate (default 8000 Hz)");
     Serial.println("                 noInterrupts during scan, free-running idle");
@@ -4388,6 +4622,10 @@ static void process_command() {
         running = was_running;
     } else if (strcmp(cmd_buf, "MSMSCAN") == 0 && args) {
         cmd_msmscan(args);
+#if PANEL_REV == 31
+    } else if (strcmp(cmd_buf, "PIOFULL") == 0) {
+        cmd_piofull(args);
+#endif
     } else if (strcmp(cmd_buf, "BCM") == 0 && args) {
         cmd_bcm_set(args);
     } else if (strcmp(cmd_buf, "BCMON") == 0 && args) {
