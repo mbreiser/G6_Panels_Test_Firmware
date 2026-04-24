@@ -112,6 +112,7 @@ python3 test_firmware/single_led/auto_test.py cmd "BURST 10000"
 - **Phase 4**: BCM grayscale — single-row-per-trigger BCM with 3 modes (PIO/DMA/MSM). **Zero jitter achieved** with multicore lockout + noInterrupts + noinline + warm-up. Full sweep: 640k measurements, all showing 0.007 µs jitter (1 cycle), 0 outliers. 4-bit BCM at T=0.5 µs: 9.49 µs burst, fits 15 µs with 5.5 µs margin. 400 Hz frame rate. Visually verified (BCMDEMO ramp test).
 - **Phase 5a**: RAMBURST — production-realistic frame loading. 8 test frames cycling at 400 Hz from RAM, incremental per-row precompute (38 µs/row during 115 µs idle). **0.007 µs jitter** with frame swaps happening. Critical `noinline` bug found and fixed: compiler was silently inlining `__not_in_flash_func` into flash callers.
 - **Phase 6**: External trigger + optical characterization — GP45 external trigger (bodge wire), zero jitter confirmed with real 8 kHz waveform generator. PHOTOCAL command cycles 16 BCM levels. Saleae Logic Pro 8 automation via Python API. Pulse-triggered averaging resolves BCM bit-plane structure (B0-B3 at 1:2:4:8 ratio) in photodiode signal. BCMWEIGHTS command for custom bit-plane weights (6.67 ns resolution) to enable linearity calibration. Ocean Insight Flame X spectrometer: LED peak at 570.8 nm. Spectrometer linearity measurement: 16 BCM levels, 50 ms integration, 20 nm window (560-580 nm). Key finding: brightness-per-microsecond decreases with longer bit-planes (B0=3163 cts/us to B3=2024 cts/us, 56% drop). BCMWEIGHTS optimizer converged to [1, 2, 5.02, 10.19] at T=0.7 us: monotonic, 2.5% max error, 12.7 us burst fits 15 us window. BCMORDER REVERSE command added to test if bit-plane scan order affects brightness.
+- **Phase 7**: AD3 integration — Digilent Analog Discovery 3 replaces external function generator + Saleae for optical characterization. W1 wavegen drives GP45 trigger, scope Ch1 captures photodiode, Ch2 captures trigger reference. Two acquisition modes characterized: (1) **Record mode** (USB streaming): max 5 MHz single-ch or 2 MHz dual-ch clean (USB 2.0 bottleneck at ~5 MS/s total); (2) **Triggered single-shot mode** (on-device FPGA buffer): up to 100 MHz at 32K samples/channel (Config 1), no USB bottleneck. At 12.5 MHz dual-channel with 32K buffer = 2,621 µs window, covering full 2.5 ms row cycle. PIXEL command added to firmware for individual pixel control. Trigger-to-LED latency measured: 1.5–1.6 µs (GP45 edge to photodiode onset). Key finding: pixel_data[10] maps to 2 physical rows (trigger offsets 3 and 12 in 20-row cycle) due to coordinate interleaving — needs investigation.
 
 ## Key Technical Findings
 
@@ -171,13 +172,34 @@ BCMBURST 10000 with real 8 kHz external trigger on GP45: 0.000 µs jitter, 9.507
 ### Saleae Logic Pro 8 integration
 Python automation via `saleae_capture.py` using Logic 2 API. Captures digital trigger + analog photodiode simultaneously. Pulse-triggered averaging across 499 pulses at 50 MHz resolves individual BCM bit-planes and ~0.4 µs PIO overhead gaps.
 
+### Digilent Analog Discovery 3 (AD3) integration
+Replaces external function generator + Saleae for optical characterization. Python control via raw ctypes to DWF SDK (`/Library/Frameworks/dwf.framework/dwf`). **Must use homebrew Python 3.14** — macOS Sequoia's system Python 3.9 crashes on dyld circular rpath when loading the DWF framework. The `pydwf` package has a version mismatch (expects SDK 3.20.1, installed 3.25.1) — use raw ctypes instead.
+
+**Two acquisition modes:**
+
+| Mode | Max Rate | Mechanism | Use Case |
+|------|----------|-----------|----------|
+| Record (streaming) | 5 MHz 1ch / 2 MHz 2ch | USB 2.0 transfer | Long captures (seconds) |
+| Triggered single-shot | **100 MHz** 1ch or 2ch | On-device FPGA buffer | Short bursts at full resolution |
+
+**Triggered mode is preferred** for BCM burst characterization. Key settings:
+- `FDwfDeviceConfigOpen(idx, 1, ...)` — Config 1 gives 32K samples/channel (vs 16K default)
+- `FDwfAnalogInAcquisitionModeSet(hdwf, acqmodeSingle)` — single-shot, not record
+- Trigger on `trigsrcAnalogOut1` (W1 output) for hardware-aligned captures
+- At 12.5 MHz: 32K samples = 2,621 µs window, covers full 2.5 ms (20-row) BCM cycle
+- Re-arm rate: ~137 captures/sec (dual-channel) or ~727/sec (single-channel)
+- **Classify captures by row position**: each trigger hits a random row in the 20-row cycle; post-hoc classification by PD peak location enables row-specific averaging
+
+**AD3 exclusive access**: the WaveForms GUI app cannot be used simultaneously with SDK control. Kill all python3.14 processes if device appears busy. Serial port name changes between USB reconnections.
+
 ## Next Steps
 
 ### Immediate
-1. **Test BCMORDER REVERSE** — Determine if bit-plane scan order (B3->B0 vs B0->B3) affects per-bit-plane brightness decay. Re-run optimizer with reverse order to see if linearity improves.
-2. **Update PowerPoint slides** — Add linearity comparison (default vs optimized weights, forward vs reverse order) to summary presentation.
-3. **Probe LED pin (GP1) on Saleae** — Measure trigger-to-LED latency and confirm bit-plane timing directly on column driver pin (eliminates photodiode bandwidth uncertainty).
-4. **PCB redesign** — See PCB_REDESIGN_ANALYSIS.md. Option B (add EINT trace to GP45) recommended for next revision.
+1. **Investigate coordinate interleaving**: pixel_data[10] maps to 2 physical rows (trigger offsets 3 and 12). Check `utilities.cpp` NUM_COLOR=4 mapping — is this expected, or a bug?
+2. **AD3 high-resolution burst characterization**: Use triggered mode at 100 MHz to resolve individual BCM bit-planes with 10 ns resolution. Capture single burst, classify by row, average.
+3. **Test BCMORDER REVERSE** — Re-run optimizer with reverse bit-plane order.
+4. **Probe LED pin (GP1) on AD3 Ch2** — Measure trigger-to-LED latency directly (eliminates photodiode bandwidth uncertainty). Currently measured at 1.5–1.6 µs via photodiode.
+5. **PCB redesign** — See PCB_REDESIGN_ANALYSIS.md. Option B (add EINT trace to GP45) recommended for next revision.
 
 ### After optical calibration
 - **Per-pixel pattern loading** — USB or SPI interface for host to send pixel_data[20][20] frames
@@ -194,6 +216,7 @@ Python automation via `saleae_capture.py` using Logic 2 API. Captures digital tr
 - ~~**Optical characterization (initial)**~~ — Photodiode + Saleae pulse-triggered averaging resolves BCM bit-planes. BCMWEIGHTS enables calibration.
 - ~~**Saleae Logic Pro 8 automation**~~ — Python API integration for synchronized digital+analog capture and analysis.
 - ~~**Spectrometer linearity characterization**~~ — Ocean Insight Flame X (570.8 nm peak, 50 ms integration, 560-580 nm window). Per-bit-plane brightness decay measured (B0=3163 cts/us to B3=2024 cts/us). BCMWEIGHTS optimizer converged to [1, 2, 5.02, 10.19] at T=0.7 us for monotonic response (2.5% max error, 12.7 us burst).
+- ~~**AD3 setup and USB bandwidth characterization**~~ — Record mode caps at 5 MS/s (USB 2.0). Triggered single-shot mode at 100 MHz with 32K buffer (Config 1) is the solution. Dual-channel 12.5 MHz covers full 2.5 ms row cycle. Row-classified averaging recovers full signal from random-trigger captures.
 
 **Guiding principle**: Jitter and timing budget compliance come first. Mode A (PIO + noInterrupts) is the production architecture.
 
@@ -211,6 +234,8 @@ Python automation via `saleae_capture.py` using Logic 2 API. Captures digital tr
 - `test_firmware/single_led/bcm_jitter_sweep.py` — BCM jitter sweep (4 T × 16 intensities × 10k frames)
 - `test_firmware/single_led/run_tests.py` — automated serial test harness (legacy)
 - `test_firmware/single_led/visual_test.py` — interactive visual verification
+- `test_firmware/single_led/ad3_capture.py` — AD3 integration: wavegen trigger + dual-channel scope capture (record + triggered modes)
+- `test_firmware/single_led/build_viewer.py` — builds HTML viewer from AD3 triggered capture data
 - `test_firmware/single_led/saleae_capture.py` — Saleae Logic 2 automation + analysis
 - `test_firmware/single_led/spectrometer_cal.py` — Ocean Insight Flame X spectrometer calibration and linearity measurement
 - `test_firmware/single_led/bcm_weight_optimizer.py` — iterative BCM weight optimizer using spectrometer feedback
@@ -224,7 +249,7 @@ PIO: `PIOSCAN n`, `PIOSCAN2 n` (unprotected), `PIOROWTIME n`
 Hybrid DMA+ISR: `DMASCAN n`, `DMATEST`
 Multi-SM PIO: `MSMSCAN n`, `MSMTEST`
 Burst mode (2P sync sim): `BURST n [rate_hz]` — default 8 kHz trigger rate, `noInterrupts()` during scan burst
-BCM burst (Phase 4): `BCM bits`, `BCMON us`, `FILL intensity`, `GRADIENT`, `BCMBURST n [Hz] [A|B|C]`, `BCMDEMO`
+BCM burst (Phase 4): `BCM bits`, `BCMON us`, `FILL intensity`, `PIXEL row col intensity`, `GRADIENT`, `BCMBURST n [Hz] [A|B|C]`, `BCMDEMO`
 RAM burst (Phase 5a): `RAMBURST n [Hz] [n_frames] [P]` — frame cycling from RAM, P=pre-emptive noInterrupts
 External trigger (Phase 6): `EXTTRIG ON|OFF`, `TRIGTEST [N]`, `PHOTOCAL [hold_sec]`, `BCMWEIGHTS w0 w1 ...`, `BCMORDER REV|FWD`
 System: `REBOOT` (enters BOOTSEL mode for flashing)

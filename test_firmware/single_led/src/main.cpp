@@ -2437,6 +2437,25 @@ static void cmd_fill(const char* arg) {
     Serial.println(")");
 }
 
+static void cmd_pixel(const char* args) {
+    int r, c, val;
+    if (sscanf(args, "%d %d %d", &r, &c, &val) != 3 ||
+        r < 0 || r >= PANEL_SIZE || c < 0 || c >= PANEL_SIZE) {
+        Serial.println("ERR: PIXEL <row 0-19> <col 0-19> <intensity>");
+        return;
+    }
+    int max_val = (1 << bcm_bits) - 1;
+    if (val < 0) val = 0;
+    if (val > max_val) val = max_val;
+    pixel_data[r][c] = (uint8_t)val;
+    Serial.print("PIXEL (");
+    Serial.print(r);
+    Serial.print(",");
+    Serial.print(c);
+    Serial.print(") = ");
+    Serial.println(val);
+}
+
 static void cmd_gradient() {
     int max_val = (1 << bcm_bits) - 1;
     for (int r = 0; r < PANEL_SIZE; r++)
@@ -4367,6 +4386,8 @@ static void process_command() {
         cmd_bcmorder(args);
     } else if (strcmp(cmd_buf, "FILL") == 0 && args) {
         cmd_fill(args);
+    } else if (strcmp(cmd_buf, "PIXEL") == 0 && args) {
+        cmd_pixel(args);
     } else if (strcmp(cmd_buf, "GRADIENT") == 0) {
         cmd_gradient();
     } else if (strcmp(cmd_buf, "BCMBURST") == 0) {
